@@ -1,400 +1,95 @@
-# Copyright (c) 2013-2015 Marin Atanasov Nikolov <dnaeon@gmail.com>
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions
-# are met:
-# 1. Redistributions of source code must retain the above copyright
-#    notice, this list of conditions and the following disclaimer
-#    in this position and unchanged.
-# 2. Redistributions in binary form must reproduce the above copyright
-#    notice, this list of conditions and the following disclaimer in the
-#    documentation and/or other materials provided with the distribution.
-#
-# THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
-# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
-# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
-# IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
-# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
-# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
-# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-"""
-VMware vSphere tasks module for vPoller
-
-For more information about the VMware vSphere SDK,
-which this module is using please check the link below:
-
-    - https://www.vmware.com/support/developer/vc-sdk/
-
-"""
-
-
+import inspect
+import datetime
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
 import pyVmomi
-
+import random
+import re
+import socket
+import struct
+import sys
+import time
+import types
 from vpoller.log import logger
 from vpoller.task.decorators import task
+import vpoller.vsphere.tasks
+
+# replacement of get_object_by_property on vconnector core.py as it sucks at building cache
+from vconnector.core import VConnector
+from vconnector.cache import CachedObject
 
 
-def _discover_objects(agent, properties, obj_type):
+def get_object_by_property_cache_all(self, property_name, property_value, obj_type):
     """
-    Helper method to simplify discovery of vSphere managed objects
+    Find a Managed Object by a propery
 
-    This method is used by the '*.discover' vPoller Worker methods and is
-    meant for collecting properties for multiple objects at once, e.g.
-    during object discovery operation.
+    If cache is enabled then we search for the managed object from the
+    cache first and if present we return the object from cache.
 
     Args:
-        agent         (VConnector): Instance of VConnector
-        properties          (list): Properties to be collected
-        obj_type   (pyVmomi.vim.*): Type of vSphere managed object
+        property_name            (str): Name of the property to look for
+        property_value           (str): Value of the property to match
+        obj_type       (pyVmomi.vim.*): Type of the Managed Object
 
     Returns:
-        The discovered objects in JSON format
+        The first matching object
 
     """
-    logger.info(
-        '[%s] Discovering %s managed objects',
-        agent.host,
-        obj_type.__name__
-    )
+    # logging.info('ALL YOUR METHODS ARE BELONG TO ME !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+    if not issubclass(obj_type, pyVmomi.vim.ManagedEntity):
+        raise VConnectorException('Type should be a subclass of vim.ManagedEntity')
 
-    view_ref = agent.get_container_view(obj_type=[obj_type])
-    try:
-        data = agent.collect_properties(
-            view_ref=view_ref,
-            obj_type=obj_type,
-            path_set=properties
-        )
-    except Exception as e:
-        return {'success': 1, 'msg': 'Cannot collect properties: {}'.format(e.message)}
+    if self.cache_enabled:
+        cached_obj_name = '{}:{}'.format(obj_type.__name__, property_value)
+        if cached_obj_name in self.cache:
+            logging.debug('Using cached object %s', cached_obj_name)
+            return self.cache.get(cached_obj_name)
 
-    view_ref.DestroyView()
-
-    result = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': data,
-    }
-
-    return result
-
-def _get_object_properties(agent,
-                           properties,
-                           obj_type,
-                           obj_property_name,
-                           obj_property_value,
-                           include_mors=False):
-    """
-    Helper method to simplify retrieving of properties
-
-    This method is used by the '*.get' vPoller Worker methods and is
-    meant for collecting properties for a single managed object.
-
-    We first search for the object with property name and value,
-    then create a list view for this object and
-    finally collect it's properties.
-
-    Args:
-        agent            (VConnector): A VConnector instance
-        properties             (list): List of properties to be collected
-        obj_type       pyVmomi.vim.*): Type of vSphere managed object
-        obj_property_name       (str): Property name used for searching for the object
-        obj_property_value      (str): Property value identifying the object in question
-
-    Returns:
-        The collected properties for this managed object in JSON format
-
-    """
-    logger.info(
-        '[%s] Retrieving properties for %s managed object of type %s',
-        agent.host,
-        obj_property_value,
-        obj_type.__name__
-    )
-
-    # Find the Managed Object reference for the requested object
-    try:
-        obj = agent.get_object_by_property(
-            property_name=obj_property_name,
-            property_value=obj_property_value,
-            obj_type=obj_type
-        )
-    except Exception as e:
-        return {'success': 1, 'msg': 'Cannot collect properties: {}'.format(e.message)}
-
-    if not obj:
-        return {
-            'success': 1,
-            'msg': 'Cannot find object {}'.format(obj_property_value)
-        }
-
-    # Create a list view for this object and collect properties
-    view_ref = agent.get_list_view(obj=[obj])
-
-    try:
-        data = agent.collect_properties(
-            view_ref=view_ref,
-            obj_type=obj_type,
-            path_set=properties,
-            include_mors=include_mors
-        )
-    except Exception as e:
-        return {'success': 1, 'msg': 'Cannot collect properties: {}'.format(e.message)}
-
-    view_ref.DestroyView()
-
-    result = {
-        'success': 0,
-        'msg': 'Successfully retrieved object properties',
-        'result': data,
-    }
-
-    return result
-
-def _object_datastore_get(agent, obj_type, name):
-    """
-    Helper method used for getting the datastores available to an object
-
-    This method searches for the managed object with 'name' and retrieves
-    the 'datastore' property which contains all datastores available/used
-    by the managed object, e.g. VirtualMachine, HostSystem.
-
-    Args:
-        agent       (VConnector): A VConnector instance
-        obj_type (pyVmomi.vim.*): Managed object type
-        name               (str): Name of the managed object, e.g. host, vm
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting datastores for %s managed object of type %s',
-        agent.host,
-        name,
-        obj_type.__name__
-    )
-
-    # Find the object by it's 'name' property
-    # and get the datastores available/used by it
-    data = _get_object_properties(
-        agent=agent,
-        properties=['datastore'],
-        obj_type=obj_type,
-        obj_property_name='name',
-        obj_property_value=name
-    )
-
-    if data['success'] != 0:
-        return data
-
-    # Get the name and datastore properties from the result
-    props = data['result'][0]
-    obj_datastores = props['datastore']
-
-    # Get a list view of the datastores available/used by
-    # this object and collect properties
-    view_ref = agent.get_list_view(obj=obj_datastores)
-    result = agent.collect_properties(
+    # logging.info('Looking up object %s', cached_obj_name)
+    view_ref = self.get_container_view(obj_type=[obj_type])
+    props = self.collect_properties(
         view_ref=view_ref,
-        obj_type=pyVmomi.vim.Datastore,
-        path_set=['name', 'info.url']
+        obj_type=obj_type,
+        path_set=[property_name],
+        include_mors=True
     )
-
     view_ref.DestroyView()
 
-    r = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': result,
-    }
+    obj = None
+    for each_obj in props:
+        obj = None
 
-    return r
+        if self.cache_enabled:
+            if each_obj.get(property_name) is not None:
+                cached_obj_key = '{}:{}'.format(obj_type.__name__, each_obj[property_name])
+            else:
+                cached_obj_key = None
 
-def _object_alarm_get(agent,
-                      obj_type,
-                      obj_property_name,
-                      obj_property_value):
-    """
-    Helper method for retrieving alarms for a single Managed Object
+        if cached_obj_key is not None and cached_obj_key not in self.cache:
+            obj = each_obj['obj']
+            cached_obj = CachedObject(
+                name=cached_obj_key,
+                obj=obj,
+                ttl=self.cache_ttl
+            )
+            self.cache.add(obj=cached_obj)
 
-    Args:
-        agent            (VConnector): A VConnector instance
-        obj_type      (pyVmomi.vim.*): Type of the Managed Object
-        obj_property_name       (str): Property name used for searching for the object
-        obj_property_value      (str): Property value identifying the object in question
+        if each_obj.get(property_name) == property_value:
+            break
+        else:
+            obj = None
 
-    Returns:
-        The triggered alarms for the Managed Object
+    return obj
 
-    """
-    logger.debug(
-        '[%s] Retrieving alarms for %s managed object of type %s',
-        agent.host,
-        obj_property_value,
-        obj_type.__name__
-    )
 
-    # Get the 'triggeredAlarmState' property for the managed object
-    data = _get_object_properties(
-        agent=agent,
-        properties=['triggeredAlarmState'],
-        obj_type=obj_type,
-        obj_property_name=obj_property_name,
-        obj_property_value=obj_property_value
-    )
+logging.info(
+    'Overriding Vconnector.get_object_by_property method with tasks_extension.py get_object_by_property_cache_all')
+VConnector.get_object_by_property = get_object_by_property_cache_all
 
-    if data['success'] != 0:
-        return data
 
-    result = []
-    props = data['result'][0]
-    alarms = props['triggeredAlarmState']
-    for alarm in alarms:
-        a = {
-            'key': str(alarm.key),
-            'info': alarm.alarm.info.name,
-            'time': str(alarm.time),
-            'entity': alarm.entity.name,
-            'acknowledged': alarm.acknowledged,
-            'overallStatus': alarm.overallStatus,
-            'acknowledgedByUser': alarm.acknowledgedByUser,
-        }
-        result.append(a)
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully retrieved alarms',
-        'result': result,
-    }
-
-    return r
-
-def _get_counter_by_id(agent, counter_id):
-    """
-    Get a counter by its id
-
-    Args:
-        agent      (VConnector): A VConnector instance
-        counter_id        (int): A counter ID
-
-    Returns:
-        A vim.PerformanceManager.CounterInfo instance
-
-    """
-    for c in agent.perf_counter:
-        if c.key == counter_id:
-            return c
-
-    return None
-
-def _get_counter_by_name(agent, name):
-    """
-    Get a counter by its name
-
-    A counter name is expected to be in the following form:
-
-        - <group>.<name>.<unit>.<rollup>
-
-    Args:
-        agent (VConnector): A VConnector instance
-        name         (str): A counter name
-
-    Returns:
-        A vim.PerformanceManager.CounterInfo instance
-
-    """
-    for c in agent.perf_counter:
-        c_name = '{}.{}.{}.{}'.format(c.groupInfo.key, c.nameInfo.key, c.unitInfo.key, c.rollupType)
-        if name == c_name:
-            return c
-
-    return None
-
-def _entity_perf_metric_info(agent, entity, counter_name=''):
-    """
-    Get info about supported performance metrics for a managed entity
-
-    If the managed entity supports real-time statistics then
-    return the real-time performance counters available for it,
-    otherwise fall back to historical statistics only.
-
-    Args:
-        agent           (VConnector): A VConnector instance
-        entity       (pyVmomi.vim.*): A managed entity to lookup
-        counter_name           (str): Performance counter name
-
-    Returns:
-        Information about supported performance metrics for the entity
-
-    """
-    if not isinstance(entity, pyVmomi.vim.ManagedEntity):
-        return {'success': 0, 'msg': '{} is not a managed entity'.format(entity)}
-
-    if counter_name:
-        counter_info = _get_counter_by_name(
-            agent=agent,
-            name=counter_name
-        )
-        if not counter_info:
-            return {
-                'success': 1,
-                'msg': 'Unknown performance counter requested'
-            }
-
-    provider_summary = agent.si.content.perfManager.QueryPerfProviderSummary(
-        entity=entity
-    )
-
-    logger.debug(
-        '[%s] Entity %s supports real-time statistics: %s',
-        agent.host,
-        entity.name,
-        provider_summary.currentSupported
-    )
-    logger.debug(
-        '[%s] Entity %s supports historical statistics: %s',
-        agent.host,
-        entity.name,
-        provider_summary.summarySupported
-    )
-
-    interval_id = provider_summary.refreshRate if provider_summary.currentSupported else None
-    try:
-        metric_id = agent.si.content.perfManager.QueryAvailablePerfMetric(
-            entity=entity,
-            intervalId=interval_id
-        )
-    except pyVmomi.vim.InvalidArgument as e:
-        return {
-            'success': 1,
-            'msg': 'Cannot retrieve performance metrics for {1}: {2}'.format(entity.name, e)
-        }
-
-    if counter_name:
-        data = [{k: getattr(m, k) for k in ('counterId', 'instance')} for m in metric_id if m.counterId == counter_info.key]
-    else:
-        data = [{k: getattr(m, k) for k in ('counterId', 'instance')} for m in metric_id]
-
-    # Convert counter ids to human-friendly names
-    for e in data:
-        c_id = e['counterId']
-        c_info = _get_counter_by_id(agent=agent, counter_id=c_id)
-        e['counterId'] = '{}.{}.{}.{}'.format(c_info.groupInfo.key, c_info.nameInfo.key, c_info.unitInfo.key, c_info.rollupType)
-
-    result = {
-        'msg': 'Successfully retrieved performance metrics',
-        'success': 0,
-        'result': data
-    }
-
-    return result
-
-def _entity_perf_metric_get(agent, entity, counter_name, max_sample=1, instance='', interval_name=None):
+def _entity_perf_metrics_get(agent, entity, counter_name, max_sample=1, instance='', interval_name=None):
     """
     Retrieve performance metrics from a managed object
 
@@ -411,7 +106,7 @@ def _entity_perf_metric_get(agent, entity, counter_name, max_sample=1, instance=
 
     """
     logger.info(
-        '[%s] Retrieving performance metric %s for %s',
+        '[%s] Retrieving performance metrics %s for %s',
         agent.host,
         counter_name,
         entity.name,
@@ -464,841 +159,104 @@ def _entity_perf_metric_get(agent, entity, counter_name, max_sample=1, instance=
     else:
         interval_id = provider_summary.refreshRate
 
-    counter_info = _get_counter_by_name(
-        agent=agent,
-        name=counter_name
-    )
+    metric_ids = []
+    metric_id_map = {}
+    for cn in counter_name.split(','):
+        counter_info = vpoller.vsphere.tasks._get_counter_by_name(
+            agent=agent,
+            name=cn
+        )
 
-    if not counter_info:
-        return {
-            'success': 1,
-            'msg': 'Unknown performance counter requested'
-        }
+        if not counter_info:
+            return {
+                'success': 1,
+                'msg': 'Unknown performance counter requested'
+            }
 
-    metric_id = pyVmomi.vim.PerformanceManager.MetricId(
-        counterId=counter_info.key,
-        instance=instance
-    )
+        metric_id = pyVmomi.vim.PerformanceManager.MetricId(
+            counterId=counter_info.key,
+            instance=instance
+        )
 
-    # TODO: Be able to specify interval with startTime and endTime as well
-    # TODO: Might want to be able to retrieve multiple metrics as well
-    query_spec = pyVmomi.vim.PerformanceManager.QuerySpec(
-        maxSample=max_sample,
-        entity=entity,
-        metricId=[metric_id],
-        intervalId=interval_id
-    )
+        metric_ids.append(metric_id)
+        metric_id_map[metric_id.counterId] = cn
+
+    # startTime=datetime.datetime.now(pytz.timezone('US/Eastern'))-datetime.timedelta(minutes=5)
+    if provider_summary.currentSupported:
+        query_spec = pyVmomi.vim.PerformanceManager.QuerySpec(
+            maxSample=max_sample,
+            entity=entity,
+            metricId=metric_ids,
+            intervalId=interval_id
+        )
+
+    else:
+        # vcenter seems to be a bit behind here to double up the interval to ensure we get some data
+        # should never get 2 values, but if we do, it'll focus down later on
+        startTime = datetime.datetime.now() - datetime.timedelta(minutes=(interval_id / 60 * 2))
+        query_spec = pyVmomi.vim.PerformanceManager.QuerySpec(
+            maxSample=max_sample,
+            entity=entity,
+            metricId=metric_ids,
+            startTime=startTime,
+            intervalId=interval_id
+        )
 
     data = agent.si.content.perfManager.QueryPerf(
         querySpec=[query_spec]
     )
 
     result = []
+    result_latest = {}
     for sample in data:
         sample_info, sample_value = sample.sampleInfo, sample.value
         for value in sample_value:
-            for s, v in zip(sample_info, value.value):
-                d = {
-                    'interval': s.interval,
-                    'timestamp': str(s.timestamp),
-                    'counterId': counter_name,
-                    'instance': value.id.instance,
-                    'value': v
-                }
-                result.append(d)
+            if instance != '*' or value.id.instance != '':
+                for s, v in zip(sample_info, value.value):
+                    d = {
+                        'interval': s.interval,
+                        'timestamp': str(s.timestamp),
+                        'counterId': metric_id_map[value.id.counterId],
+                        'instance': value.id.instance,
+                        'value': v
+                    }
+                    result.append(d)
+
+                    key_latest = str(value.id.instance) + str(metric_id_map[value.id.counterId])
+                    prev = result_latest.get(key_latest)
+                    if prev is not None:
+                        if datetime.datetime.strptime(prev['timestamp'],
+                                                      '%Y-%m-%d %H:%M:%S+00:00') < datetime.datetime.strptime(
+                                d['timestamp'], '%Y-%m-%d %H:%M:%S+00:00'):
+                            result_latest[key_latest] = d
+                    else:
+                        result_latest[key_latest] = d
+
+    # TODO: add an option to focus to only most recent rather than hard coded here
+    result2 = []
+    for k, v in result_latest.iteritems():
+        result2.append(v)
 
     r = {
         'msg': 'Successfully retrieved performance metrics',
         'success': 0,
-        'result': result,
+        'result': result2,
     }
 
     return r
 
-@task(name='about')
-def about(agent, msg):
-    """
-    Get the 'about' information for the vSphere host
 
-    Example client message would be:
+def pool_type(pool_name):
+    pool_type = 99  # unknown
+    if re.match('^...........C', pool_name) or re.match('^...........K', pool_name) or re.match('^...........I',
+                                                                                                pool_name):
+        pool_type = 1  # core
+    elif re.match('^...........B', pool_name) or re.match('^...........H', pool_name) or re.match('^...........J',
+                                                                                                  pool_name):
+        pool_type = 0  # basic
 
-    {
-        "method":   "about",
-        "hostname": "vc01.example.org"
-    }
+    return pool_type
 
-    Example client message requesting additional properties:
-
-    {
-        "method":   "about",
-        "hostname": "vc01.example.org"
-        "properties": [
-            "apiType",
-            "apiVersion",
-            "version"
-        ]
-    }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    logger.info("[%s] Retrieving vSphere About information", agent.host)
-
-    # If no properties are specified just return the 'fullName' property
-    if 'properties' not in msg or not msg['properties']:
-        properties = ['fullName']
-    else:
-        properties = msg['properties']
-
-    data = {prop: getattr(agent.si.content.about, prop, '(null)') for prop in properties}
-    result = {
-        'msg': 'Successfully retrieved properties',
-        'success': 0,
-        'result': [data],
-    }
-
-    return result
-
-@task(name='event.latest')
-def event_latest(agent, msg):
-    """
-    Get the latest event registered
-
-    Example client message would be:
-
-    {
-        "method":   "event.latest",
-        "hostname": "vc01.example.org",
-    }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    logger.info('[%s] Retrieving latest registered event', agent.host)
-
-    e = agent.si.content.eventManager.latestEvent.fullFormattedMessage
-
-    result = {
-        'msg': 'Successfully retrieved event',
-        'success': 0,
-        'result': [{'event': e}],
-    }
-
-    return result
-
-@task(name='session.get')
-def session_get(agent, msg):
-    """
-    Get the established vSphere sessions
-
-    Example client message would be:
-
-    {
-        "method":   "session.get",
-        "hostname": "vc01.example.org",
-    }
-
-    Returns:
-        The established vSphere sessions in JSON format
-
-    """
-    logger.info('[%s] Retrieving established sessions', agent.host)
-
-    try:
-        sm = agent.si.content.sessionManager
-        session_list = sm.sessionList
-    except pyVmomi.vim.NoPermission:
-        return {
-            'msg': 'No permissions to view established sessions',
-            'success': 1
-        }
-
-    # Session properties to be collected
-    props = [
-        'key',
-        'userName',
-        'fullName',
-        'loginTime',
-        'lastActiveTime',
-        'ipAddress',
-        'userAgent',
-        'callCount'
-    ]
-
-    sessions = []
-    for session in session_list:
-        s = {k: str(getattr(session, k)) for k in props}
-        sessions.append(s)
-
-    result = {
-        'msg': 'Successfully retrieved sessions',
-        'success': 0,
-        'result': sessions,
-    }
-
-    return result
-
-@task(name='perf.metric.info')
-def perf_metric_info(agent, msg):
-    """
-    Get all performance counters supported by the vSphere host
-
-    Example client message would be:
-
-    {
-        "method":   "perf.metric.info",
-        "hostname": "vc01.example.org",
-    }
-
-    Returns:
-        The list of supported performance counters by the vSphere host
-
-    """
-    logger.info(
-        '[%s] Retrieving supported performance counters',
-        agent.host
-    )
-
-    data = []
-    for c in agent.perf_counter:
-        d = {
-            'key': c.key,
-            'nameInfo': {k: getattr(c.nameInfo, k) for k in ('label', 'summary', 'key')},
-            'groupInfo': {k: getattr(c.groupInfo, k) for k in ('label', 'summary', 'key')},
-            'unitInfo': {k: getattr(c.unitInfo, k) for k in ('label', 'summary', 'key')},
-            'rollupType': c.rollupType,
-            'statsType': c.statsType,
-            'level': c.level,
-            'perDeviceLevel': c.perDeviceLevel,
-        }
-        data.append(d)
-
-    result = {
-        'success': 0,
-        'msg': 'Successfully retrieved performance metrics info',
-        'result': data
-    }
-
-    return result
-
-@task(name='perf.interval.info')
-def perf_interval_info(agent, msg):
-    """
-    Get information about existing performance historical intervals
-
-    Example client message would be:
-
-    {
-        "method":   "perf.interval.info",
-        "hostname": "vc01.example.org",
-    }
-
-    Returns:
-        The existing performance historical interval on the system
-
-    """
-    logger.info(
-        '[%s] Retrieving existing performance historical intervals',
-        agent.host
-    )
-
-    historical_interval = agent.si.content.perfManager.historicalInterval
-
-    data = [{k: getattr(interval, k) for k in ('enabled', 'key', 'length', 'level', 'name', 'samplingPeriod')} for interval in historical_interval]
-
-    result = {
-        'msg': 'Successfully retrieved performance historical intervals',
-        'success': 0,
-        'result': data
-    }
-
-    return result
-
-@task(name='net.discover')
-def net_discover(agent, msg):
-    """
-    Discover all pyVmomi.vim.Network managed objects
-
-    Example client message would be:
-
-    {
-        "method":   "net.discover",
-        "hostname": "vc01.example.org",
-    }
-
-    Example client message which also requests additional properties:
-
-    {
-        "method":     "net.discover",
-        "hostname":   "vc01.example.org",
-        "properties": [
-            "name",
-            "summary.accessible"
-        ]
-    }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    r = _discover_objects(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.Network
-    )
-
-    return r
-
-@task(name='net.get', required=['name'])
-def net_get(agent, msg):
-    """
-    Get properties of a single pyVmomi.vim.Network managed object
-
-    Example client message would be:
-
-    {
-        "method":     "net.get",
-        "hostname":   "vc01.example.org",
-        "name":       "VM Network",
-        "properties": [
-            "name",
-            "overallStatus"
-        ]
-    }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    return _get_object_properties(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.Network,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-@task(name='net.host.get', required=['name'])
-def net_host_get(agent, msg):
-    """
-    Get all Host Systems using this pyVmomi.vim.Network managed object
-
-    Example client message would be:
-
-    {
-        "method":     "net.host.get",
-        "hostname":   "vc01.example.org",
-        "name":       "VM Network",
-    }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting hosts using %s vim.Network managed object',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the Network managed object and get the 'host' property
-    data = _get_object_properties(
-        agent=agent,
-        properties=['name', 'host'],
-        obj_type=pyVmomi.vim.Network,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    props = data['result'][0]
-    network_name, network_hosts = props['name'], props['host']
-
-    # Create a list view for the HostSystem managed objects
-    view_ref = agent.get_list_view(obj=network_hosts)
-    result = {}
-    result['name'] = network_name
-    result['host'] = agent.collect_properties(
-        view_ref=view_ref,
-        obj_type=pyVmomi.vim.HostSystem,
-        path_set=['name']
-    )
-
-    view_ref.DestroyView()
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': result,
-    }
-
-    return r
-
-@task(name='net.vm.get', required=['name'])
-def net_vm_get(agent, msg):
-    """
-    Get all Virtual Machines using this pyVmomi.vim.Network managed object
-
-    Example client message would be:
-
-    {
-        "method":     "net.vm.get",
-        "hostname":   "vc01.example.org",
-        "name":       "VM Network",
-    }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting VMs using %s vim.Network managed object',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the Network managed object and get the 'vm' property
-    data = _get_object_properties(
-        agent=agent,
-        properties=['name', 'vm'],
-        obj_type=pyVmomi.vim.Network,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    props = data['result'][0]
-    network_name, network_vms = props['name'], props['vm']
-
-    # Create a list view for the VirtualMachine managed objects
-    view_ref = agent.get_list_view(obj=network_vms)
-    result = {}
-    result['name'] = network_name
-    result['vm'] = agent.collect_properties(
-        view_ref=view_ref,
-        obj_type=pyVmomi.vim.VirtualMachine,
-        path_set=['name']
-    )
-
-    view_ref.DestroyView()
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': result,
-    }
-
-    return r
-
-@task(name='datacenter.discover')
-def datacenter_discover(agent, msg):
-    """
-    Discover all vim.Datacenter managed objects
-
-    Example client message would be:
-
-    {
-        "method":   "datacenter.discover",
-        "hostname": "vc01.example.org",
-    }
-
-    Example client message which also requests additional properties:
-
-    {
-        "method":     "datacenter.discover",
-        "hostname":   "vc01.example.org",
-        "properties": [
-            "name",
-            "overallStatus"
-        ]
-    }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    r = _discover_objects(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.Datacenter
-    )
-
-    return r
-
-@task(name='datacenter.perf.metric.get', required=['name', 'counter-name', 'perf-interval'])
-def datacenter_perf_metric_get(agent, msg):
-    """
-    Get performance metrics for a vim.Datacenter managed object
-
-    A vim.Datacenter managed entity supports historical performance
-    metrics only, so a valid historical performance interval
-    should be provided as part of the client message.
-
-    Example client message would be:
-
-    {
-        "method":   "datacenter.perf.metric.get",
-        "hostname": "vc01.example.org",
-        "name":     "MyDatacenter",
-        "counter-name": vmop.numPoweron.number  # VM power on count
-        "perf-interval": "Past day"  # Historical performance interval
-    }
-
-    Returns:
-        The retrieved performance metrics
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.Datacenter
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
-
-    counter_name = msg.get('counter-name')
-    interval_name = msg.get('perf-interval')
-
-    return _entity_perf_metric_get(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name,
-        interval_name = interval_name
-    )
-
-@task(name='datacenter.perf.metric.info')
-def datacenter_perf_metric_info(agent, msg):
-    """
-    Get performance counters available for a vim.Datacenter object
-
-    Example client message would be:
-
-    {
-        "method":      "datacenter.perf.metric.info",
-        "hostname":    "vc01.example.org",
-        "name":        "MyDatacenter",
-        "counter-name": <counter-id>
-    }
-
-    Returns:
-        Information about the supported performance counters for the object
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.Datacenter
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object {}'.format(msg['name'])}
-
-    counter_name = msg.get('counter-name')
-
-    return _entity_perf_metric_info(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name
-    )
-
-@task(name='datacenter.get', required=['name', 'properties'])
-def datacenter_get(agent, msg):
-    """
-    Get properties of a single vim.Datacenter managed object
-
-    Example client message would be:
-
-    {
-        "method":     "datacenter.get",
-        "hostname":   "vc01.example.org",
-        "name":       "MyDatacenter",
-        "properties": [
-            "name",
-            "overallStatus"
-        ]
-    }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    return _get_object_properties(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.Datacenter,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-@task(name='datacenter.alarm.get', required=['name'])
-def datacenter_alarm_get(agent, msg):
-    """
-    Get all alarms for a vim.Datacenter managed object
-
-    Example client message would be:
-
-    {
-        "method":   "datacenter.alarm.get",
-        "hostname": "vc01.example.org",
-        "name":     "MyDatacenter"
-    }
-
-    Returns:
-        The discovered alarms in JSON format
-
-    """
-    result = _object_alarm_get(
-        agent=agent,
-        obj_type=pyVmomi.vim.Datacenter,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    return result
-
-@task(name='cluster.discover')
-def cluster_discover(agent, msg):
-    """
-    Discover all vim.ClusterComputeResource managed objects
-
-    Example client message would be:
-
-    {
-        "method":   "cluster.discover",
-        "hostname": "vc01.example.org",
-    }
-
-    Example client message which also requests additional properties:
-
-    {
-        "method":     "cluster.discover",
-        "hostname":   "vc01.example.org",
-        "properties": [
-            "name",
-            "overallStatus"
-        ]
-    }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    r = _discover_objects(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.ClusterComputeResource
-    )
-
-    return r
-
-@task(name='cluster.perf.metric.get', required=['name', 'counter-name', 'perf-interval'])
-def cluster_perf_metric_get(agent, msg):
-    """
-    Get performance metrics for a vim.ClusterComputeResource managed object
-
-    A vim.ClusterComputeResource managed entity supports historical
-    statistics only, so make sure to provide a valid historical
-    performance interval as part of the client message.
-
-    Example client message would be:
-
-    {
-        "method":   "cluster.perf.metric.get",
-        "hostname": "vc01.example.org",
-        "name":     "MyCluster",
-        "counter-name": clusterServices.effectivemem.megaBytes  # Effective memory resources
-        "perf-interval": "Past day"  # Historical performance interval
-    }
-
-    Returns:
-        The retrieved performance metrics
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.ClusterComputeResource
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
-
-    counter_name = msg.get('counter-name')
-    interval_name = msg.get('perf-interval')
-
-    return _entity_perf_metric_get(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name,
-        interval_name=interval_name
-    )
-
-@task(name='cluster.perf.metric.info')
-def cluster_perf_metric_info(agent, msg):
-    """
-    Get performance counters available for a vim.ClusterComputeResource object
-
-    Example client message would be:
-
-    {
-        "method":      "cluster.perf.metric.info",
-        "hostname":    "vc01.example.org",
-        "name":        "MyCluster",
-        "counter-name": <counter-name>
-    }
-
-    Returns:
-        Information about the supported performance counters for the object
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.ClusterComputeResource
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object {}'.format(msg['name'])}
-
-    counter_name = msg.get('counter-name')
-
-    return _entity_perf_metric_info(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name
-    )
-
-@task(name='cluster.get', required=['name', 'properties'])
-def cluster_get(agent, msg):
-    """
-    Get properties of a vim.ClusterComputeResource managed object
-
-    Example client message would be:
-
-    {
-        "method":     "cluster.get",
-        "hostname":   "vc01.example.org",
-            "name":       "MyCluster",
-            "properties": [
-            "name",
-            "overallStatus"
-        ]
-    }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    return _get_object_properties(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.ClusterComputeResource,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-@task(name='cluster.alarm.get', required=['name'])
-def cluster_alarm_get(agent, msg):
-    """
-    Get all alarms for a vim.ClusterComputeResource managed object
-
-    Example client message would be:
-
-    {
-        "method":   "cluster.alarm.get",
-        "hostname": "vc01.example.org",
-        "name":     "MyCluster"
-    }
-
-    Returns:
-        The discovered alarms in JSON format
-
-    """
-    result = _object_alarm_get(
-        agent=agent,
-        obj_type=pyVmomi.vim.ClusterComputeResource,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    return result
-
-@task(name='resource.pool.discover')
-def resource_pool_discover(agent, msg):
-    """
-    Discover all vim.ResourcePool managed objects
-
-    Example client message would be:
-
-    {
-        "method":   "resource.pool.discover",
-        "hostname": "vc01.example.org",
-    }
-
-    Example client message which also requests additional properties:
-
-    {
-        "method":     "resource.pool.discover",
-        "hostname":   "vc01.example.org",
-        "properties": [
-            "name",
-            "overallStatus"
-        ]
-    }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    r = _discover_objects(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.ResourcePool
-    )
-
-    return r
 
 @task(name='resource.pool.get', required=['name', 'properties'])
 def resource_pool_get(agent, msg):
@@ -1328,7 +286,12 @@ def resource_pool_get(agent, msg):
     if 'properties' in msg and msg['properties']:
         properties.extend(msg['properties'])
 
-    return _get_object_properties(
+    properties_readd = []
+    if 'pool.type' in properties:
+        properties_readd.append('pool.type')
+        properties.remove('pool.type')
+
+    data = vpoller.vsphere.tasks._get_object_properties(
         agent=agent,
         properties=properties,
         obj_type=pyVmomi.vim.ResourcePool,
@@ -1336,551 +299,512 @@ def resource_pool_get(agent, msg):
         obj_property_value=msg['name']
     )
 
-@task(name='host.discover')
-def host_discover(agent, msg):
-    """
-    Discover all vim.HostSystem managed objects
+    properties.extend(properties_readd)
 
+    if data.get('result') is not None:
+        if 'pool.type' in properties:
+            data['result'][0]['pool.type'] = pool_type(msg['name'])
+
+    return data
+
+
+@task(name='vm.get', required=['name', 'properties'])
+def vm_get(agent, msg):
+    """
+    Get properties for a vim.VirtualMachine managed object
     Example client message would be:
-
-    {
-        "method":   "host.discover",
-        "hostname": "vc01.example.org",
-    }
-
-    Example client message which also requests additional properties:
-
-    {
-        "method":     "host.discover",
-        "hostname":   "vc01.example.org",
-        "properties": [
-            "name",
-            "runtime.powerState"
-        ]
-    }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    r = _discover_objects(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.HostSystem
-    )
-
-    return r
-
-@task(name='host.get', required=['name', 'properties'])
-def host_get(agent, msg):
-    """
-    Get properties of a single vim.HostSystem managed object
-
-    Example client message would be:
-
-    {
-        "method":     "host.get",
-        "hostname":   "vc01.example.org",
-        "name":       "esxi01.example.org",
-        "properties": [
-            "name",
-            "runtime.powerState"
-        ]
-    }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    return _get_object_properties(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.HostSystem,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-@task(name='host.alarm.get', required=['name'])
-def host_alarm_get(agent, msg):
-    """
-    Get all alarms for a vim.HostSystem managed object
-
-    Example client message would be:
-
-    {
-        "method":   "host.alarm.get",
-        "hostname": "vc01.example.org",
-        "name":     "esxi01.example.org"
-    }
-
-    Returns:
-        The discovered alarms in JSON format
-
-    """
-    result = _object_alarm_get(
-        agent=agent,
-        obj_type=pyVmomi.vim.HostSystem,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    return result
-
-@task(name='host.perf.metric.get', required=['name', 'counter-name'])
-def host_perf_metric_get(agent, msg):
-    """
-    Get performance metrics for a vim.HostSystem managed object
-
-    Example client message would be:
-
-    {
-        "method":       "host.perf.metric.get",
-        "hostname":     "vc01.example.org",
-        "name":         "esxi01.example.org",
-        "counter-name": "net.usage.kiloBytesPerSecond",
-        "instance":     "vmnic0",
-        "max_sample": 1
-    }
-
-    Returns:
-        The retrieved performance metrics
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.HostSystem
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
-
-    if obj.runtime.powerState != pyVmomi.vim.HostSystemPowerState.poweredOn:
-        return {'success': 1, 'msg': 'Host is not powered on, cannot get performance metrics'}
-
-    if obj.runtime.connectionState != pyVmomi.vim.HostSystemConnectionState.connected:
-        return {'success': 1, 'msg': 'Host is not connected, cannot get performance metrics'}
-
-    try:
-        counter_name = msg.get('counter-name')
-        max_sample = int(msg.get('max-sample')) if msg.get('max-sample') else 1
-        interval_name = msg.get('perf-interval')
-        instance = msg.get('instance') if msg.get('instance') else ''
-    except (TypeError, ValueError):
-        logger.warning('Invalid message, cannot retrieve performance metrics')
-        return {
-            'success': 1,
-            'msg': 'Invalid message, cannot retrieve performance metrics'
-        }
-
-    return _entity_perf_metric_get(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name,
-        max_sample=max_sample,
-        instance=instance,
-        interval_name=interval_name
-    )
-
-@task(name='host.perf.metric.info', required=['name'])
-def host_perf_metric_info(agent, msg):
-    """
-    Get performance counters available for a vim.HostSystem object
-
-    Example client message would be:
-
-    {
-        "method":       "host.perf.metric.info",
-        "hostname":     "vc01.example.org",
-        "name":         "esxi01.example.org",
-        "counter-name": <counter-name>
-    }
-
-    Returns:
-        Information about the supported performance counters for the object
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.HostSystem
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object {}'.format(msg['name'])}
-
-    counter_name = msg.get('counter-name')
-
-    return _entity_perf_metric_info(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name
-    )
-
-@task(name='host.cluster.get', required=['name'])
-def host_cluster_get(agent, msg):
-    """
-    Get the cluster name for a HostSystem
-
-    Example client message would be:
-
-    {
-        "method":     "host.cluster.get",
-        "hostname":   "vc01.example.org",
-        "name":       "esxi01.example.org",
-    }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting cluster name for %s host',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the HostSystem managed object and get the 'parent' property
-    data = _get_object_properties(
-        agent=agent,
-        properties=['name', 'parent'],
-        obj_type=pyVmomi.vim.HostSystem,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    props = data['result'][0]
-    host_name, host_cluster = props['name'], props['parent']
-
-    result = {}
-    result['name'] = host_name
-    result['cluster'] = host_cluster.name
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully retrieved properties',
-        'result': [result],
-    }
-
-    return r
-
-@task(name='host.vm.get', required=['name'])
-def host_vm_get(agent, msg):
-    """
-    Get all vim.VirtualMachine objects of a HostSystem
-
-    Example client message would be:
-
         {
-            "method":     "host.vm.get",
+            "method":     "vm.get",
             "hostname":   "vc01.example.org",
-            "name":       "esxi01.example.org",
-        }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting VirtualMachine list running on %s host',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the HostSystem managed object and get the 'vm' property
-    data = _get_object_properties(
-        agent=agent,
-        properties=['vm'],
-        obj_type=pyVmomi.vim.HostSystem,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    props = data['result'][0]
-    host_vms = props['vm']
-
-    # Create a list view for the VirtualMachine managed objects
-    view_ref = agent.get_list_view(obj=host_vms)
-    result = agent.collect_properties(
-        view_ref=view_ref,
-        obj_type=pyVmomi.vim.VirtualMachine,
-        path_set=['name']
-    )
-
-    view_ref.DestroyView()
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': result,
-    }
-
-    return r
-
-@task(name='host.net.get', required=['name'])
-def host_net_get(agent, msg):
-    """
-    Get all Networks used by a vim.HostSystem managed object
-
-    Example client message would be:
-
-        {
-            "method":     "host.net.get",
-            "hostname":   "vc01.example.org",
-            "name":       "esxi01.example.org",
-        }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting Network list available for %s host',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the HostSystem managed object
-    # and get the 'network' property
-    data = _get_object_properties(
-        agent=agent,
-        properties=['name', 'network'],
-        obj_type=pyVmomi.vim.HostSystem,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    props = data['result'][0]
-    host_name, host_networks = props['name'], props['network']
-
-    # Create a list view for the Network managed objects
-    view_ref = agent.get_list_view(obj=host_networks)
-    result = {}
-    result['name'] = host_name
-    result['network'] = agent.collect_properties(
-        view_ref=view_ref,
-        obj_type=pyVmomi.vim.Network,
-        path_set=['name']
-    )
-
-    view_ref.DestroyView()
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': result,
-    }
-
-    return r
-
-@task(name='host.datastore.get', required=['name'])
-def host_datastore_get(agent, msg):
-    """
-    Get all Datastores used by a vim.HostSystem managed object
-
-    Example client message would be:
-
-        {
-            "method":   "host.datastore.get",
-            "hostname": "vc01.example.org",
-            "name":     "esxi01.example.org",
-        }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    return _object_datastore_get(
-        agent=agent,
-        obj_type=pyVmomi.vim.HostSystem,
-        name=msg['name']
-    )
-
-@task(name='vm.alarm.get', required=['name'])
-def vm_alarm_get(agent, msg):
-    """
-    Get all alarms for a vim.VirtualMachine managed object
-
-    Example client message would be:
-
-        {
-            "method":   "vm.alarm.get",
-            "hostname": "vc01.example.org",
-            "name":     "vm01.example.org"
-        }
-
-    Returns:
-        The discovered alarms in JSON format
-
-    """
-    result = _object_alarm_get(
-        agent=agent,
-        obj_type=pyVmomi.vim.VirtualMachine,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    return result
-
-@task(name='vm.perf.metric.get', required=['name', 'counter-name'])
-def vm_perf_metric_get(agent, msg):
-    """
-    Get performance metrics for a vim.VirtualMachine managed object
-
-    Example client message would be:
-
-        {
-            "method":       "vm.perf.metric.get",
-            "hostname":     "vc01.example.org",
-            "name":         "vm01.example.org",
-            "counter-name": "cpu.usagemhz.megaHertz"
-        }
-
-    For historical performance statistics make sure to pass the
-    performance interval as part of the message, e.g.:
-
-        {
-            "method":       "vm.perf.metric.get",
-            "hostname":     "vc01.example.org",
-            "name":         "vm01.example.org",
-            "counter-name": "cpu.usage.megaHertz",
-            "perf-interval": "Past day"
-        }
-
-    Returns:
-        The retrieved performance metrics
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.VirtualMachine
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
-
-    if obj.runtime.powerState != pyVmomi.vim.VirtualMachinePowerState.poweredOn:
-        return {'success': 1, 'msg': 'VM is not powered on, cannot get performance metrics'}
-
-    if obj.runtime.connectionState != pyVmomi.vim.VirtualMachineConnectionState.connected:
-        return {'success': 1, 'msg': 'VM is not connected, cannot get performance metrics'}
-
-    try:
-        counter_name = msg.get('counter-name')
-        max_sample = int(msg.get('max-sample')) if msg.get('max-sample') else 1
-        interval_name = msg.get('perf-interval')
-        instance = msg.get('instance') if msg.get('instance') else ''
-    except (TypeError, ValueError):
-        logger.warning('Invalid message, cannot retrieve performance metrics')
-        return {
-            'success': 1,
-            'msg': 'Invalid message, cannot retrieve performance metrics'
-        }
-
-    return _entity_perf_metric_get(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name,
-        max_sample=max_sample,
-        instance=instance,
-        interval_name=interval_name
-    )
-
-@task(name='vm.perf.metric.info')
-def vm_perf_metric_info(agent, msg):
-    """
-    Get performance counters available for a vim.VirtualMachine object
-
-    Example client message would be:
-
-        {
-            "method":       "vm.perf.metric.info",
-            "hostname":     "vc01.example.org",
-            "name":         "vm01.example.org",
-            "counter-name": "<counter-id>"
-        }
-
-    Returns:
-        Information about the supported performance counters for the object
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.VirtualMachine
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object {}'.format(msg['name'])}
-
-    counter_name = msg.get('counter-name')
-
-    return _entity_perf_metric_info(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name
-    )
-
-@task(name='vm.discover')
-def vm_discover(agent, msg):
-    """
-    Discover all pyVmomi.vim.VirtualMachine managed objects
-
-    Example client message would be:
-
-        {
-            "method":   "vm.discover",
-            "hostname": "vc01.example.org",
-        }
-
-    Example client message which also
-    requests additional properties:
-
-        {
-            "method":     "vm.discover",
-            "hostname":   "vc01.example.org",
+            "name":       "vm01.example.org",
             "properties": [
                 "name",
                 "runtime.powerState"
             ]
         }
-
     Returns:
-        The discovered objects in JSON format
-
+        The managed object properties in JSON format
     """
+
+    # temporary no-op for rollout switing to instaneUUID instead of name
+    # return {'success': 1, 'msg': 'temporary disable for rollout'}
+
     # Property names to be collected
-    properties = ['name']
+    properties = ['name', 'config.instanceUuid']
     if 'properties' in msg and msg['properties']:
         properties.extend(msg['properties'])
 
-    r = _discover_objects(
+    properties_readd = []
+    if 'vm.type' in properties:
+        properties_readd.append('vm.type')
+        properties.remove('vm.type')
+
+    # force resource pool... needed for vm.type and for customer tagging
+    if 'resourcePool' not in properties:
+        properties.extend(['resourcePool'])
+
+    data = vpoller.vsphere.tasks._get_object_properties(
         agent=agent,
         properties=properties,
-        obj_type=pyVmomi.vim.VirtualMachine
+        obj_type=pyVmomi.vim.VirtualMachine,
+        obj_property_name='config.instanceUuid',
+        obj_property_value=msg['name']
     )
 
+    properties.extend(properties_readd)
+
+    if data.get('result') is not None:
+        if 'runtime.host' in properties:
+            runtime_host = data['result'][0].get('runtime.host')
+            if runtime_host is not None:
+                data['result'][0]['runtime.host'] = runtime_host.name
+            else:
+                data['result'][0]['runtime.host'] = ''
+
+        if 'resourcePool' in properties:
+            resource_pool = data['result'][0].get('resourcePool')
+            if resource_pool is not None:
+                data['result'][0]['resourcePool'] = resource_pool.name
+            else:
+                data['result'][0]['resourcePool'] = ''
+
+            if 'vm.type' in properties:
+                data['result'][0]['vm.type'] = pool_type(data['result'][0]['resourcePool'])
+
+        if 'triggeredAlarmState' in properties:
+            triggeredAlarmState = data['result'][0].get('triggeredAlarmState')
+
+            alarms = []
+            alarm_count = 0
+            alarms_filtered = []
+            alarm_filtered_count = 0
+            if triggeredAlarmState is not None:
+
+                filteredAlarms = [
+                    re.compile('^Virtual machine CPU usage$', re.IGNORECASE),
+                    re.compile('^Virtual machine memory usage$', re.IGNORECASE),
+                    re.compile('^VM Snapshot Size$', re.IGNORECASE),
+                    re.compile('^Veyance - vMotion status - Basic$', re.IGNORECASE),
+                    re.compile('^Veyance - vMotion status - Core$', re.IGNORECASE),
+                    re.compile('^FCC - vMotion Status - Basic - CC cluster$', re.IGNORECASE),
+                    re.compile('^FCC - vMotion Status - Core - CC cluster$', re.IGNORECASE),
+                    re.compile('^NMT vMotion Alert$', re.IGNORECASE),
+                ]
+
+                for triggeredAlarm in triggeredAlarmState:
+                    alarm_name = triggeredAlarm.alarm.info.name
+                    alarm_desc = triggeredAlarm.alarm.info.description
+                    entity = triggeredAlarm.entity.name
+                    key = triggeredAlarm.key
+                    filtered = False
+                    for filteredAlarm in filteredAlarms:
+                        if filteredAlarm.match(alarm_name):
+                            filtered = True
+                            alarm_filtered_count += 1
+                            alarms_filtered.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+                            break
+                    if filtered:
+                        continue
+                    else:
+                        alarm_count += 1
+                        alarms.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+
+                data['result'][0]['triggeredAlarmState'] = '\n'.join(alarms)
+                data['result'][0]['triggeredAlarmFilteredState'] = '\n'.join(alarms_filtered)
+            else:
+                data['result'][0]['triggeredAlarmState'] = ''
+                data['result'][0]['triggeredAlarmFilteredState'] = ''
+
+            data['result'][0]['triggeredAlarmCount'] = alarm_count
+            data['result'][0]['triggeredAlarmFilteredCount'] = alarm_filtered_count
+
+        layout_snapshots_hash = {}
+        if 'layoutEx' in properties:
+            layout_hash = {}
+            layout = data['result'][0].get('layoutEx')
+            if layout is not None:
+
+                files = []
+                files_hash = {}
+                for ffile in layout.file:
+                    file_hash = {}
+                    file_hash['accessible'] = ffile.accessible
+                    file_hash['backingObjectId'] = ffile.backingObjectId
+                    file_hash['key'] = ffile.key
+                    file_hash['name'] = ffile.name
+                    file_hash['size'] = ffile.size
+                    file_hash['type'] = ffile.type
+                    file_hash['uniqueSize'] = ffile.uniqueSize
+                    files.append(file_hash)
+                    files_hash[ffile.key] = file_hash
+                layout_hash['file'] = files
+
+                disks = []
+                disks_hash = {}
+                for disk in layout.disk:
+                    disk_hash = {}
+                    disk_hash['key'] = disk.key
+                    chains = []
+                    for chain in disk.chain:
+                        chain_hash = {}
+                        chain_hash['fileKey'] = chain.fileKey
+                        chains.append(chain_hash)
+
+                    disk_hash['snapshotDeltaSize'] = files_hash[disk.chain[-1].fileKey[-1]]['size']
+                    disk_hash['snapshotDeltaUniqueSize'] = files_hash[disk.chain[-1].fileKey[-1]]['uniqueSize']
+
+                    disk_hash['chain'] = chains
+
+                    disks_hash[disk.key] = disk_hash
+                layout_hash['disk'] = disks
+
+                snapshots = []
+                for snapshot in layout.snapshot:
+                    snapshot_hash = {}
+                    snapshot_hash['dataKey'] = snapshot.dataKey
+                    snapshot_hash['memoryKey'] = snapshot.memoryKey
+                    snapshot_hash['key'] = str(snapshot.key)
+
+                    snapshot_disks = []
+                    snapshot_delta_size = 0
+                    snapshot_delta_unique_size = 0
+                    for snapshot_disk in snapshot.disk:
+                        snapshot_disk_hash = {}
+                        snapshot_disk_hash['key'] = snapshot_disk.key
+
+                        snapshot_chains = []
+                        for snapshot_chain in snapshot_disk.chain:
+                            snapshot_chain_hash = {}
+                            snapshot_chain_hash['fileKey'] = snapshot_chain.fileKey
+                        snapshot_disk_hash['chain'] = snapshot_chains
+
+                        snapshot_disk_hash['snapshotDeltaSize'] = disks_hash[snapshot_disk.key]['snapshotDeltaSize']
+                        snapshot_disk_hash['snapshotDeltaUniqueSize'] = disks_hash[snapshot_disk.key][
+                            'snapshotDeltaUniqueSize']
+                        snapshot_delta_size += snapshot_disk_hash['snapshotDeltaSize']
+                        snapshot_delta_unique_size += snapshot_disk_hash['snapshotDeltaUniqueSize']
+
+                        snapshot_disks.append(snapshot_disk_hash)
+                    snapshot_hash['disk'] = snapshot_disks
+                    snapshot_hash['snapshotDeltaSize'] = snapshot_delta_size
+                    snapshot_hash['snapshotDeltaUniqueSize'] = snapshot_delta_unique_size
+
+                    snapshots.append(snapshot_hash)
+                    layout_snapshots_hash[snapshot_hash['key']] = snapshot_hash
+                layout_hash['snapshot'] = snapshots
+
+            data['result'][0]['layoutEx'] = layout_hash
+
+        if 'snapshot' in properties:
+            snapshot_hash = {}
+            snapshot = data['result'][0].get('snapshot')
+            if snapshot is not None:
+                root_snapshots = []
+                for root_snapshot in snapshot.rootSnapshotList:
+                    root_snapshot_hash = {}
+                    root_snapshot_hash['vm'] = root_snapshot.vm.name
+                    root_snapshot_hash['name'] = root_snapshot.name
+                    root_snapshot_hash['description'] = root_snapshot.description
+                    root_snapshot_hash['id'] = root_snapshot.id
+                    root_snapshot_hash['createTime'] = str(root_snapshot.createTime)
+                    root_snapshot_hash['createTimeEpoch'] = (
+                                root_snapshot.createTime - datetime.datetime(1970, 1, 1, 0, 0,
+                                                                             tzinfo=root_snapshot.createTime.tzinfo)).total_seconds()
+                    root_snapshot_hash['age'] = (datetime.datetime.now(
+                        tz=root_snapshot.createTime.tzinfo) - root_snapshot.createTime).total_seconds()
+                    root_snapshot_hash['state'] = root_snapshot.state
+                    root_snapshot_hash['quiesced'] = root_snapshot.quiesced
+                    root_snapshot_hash['snapshot'] = str(root_snapshot.snapshot)
+                    root_snapshots.append(root_snapshot_hash)
+
+                    layout_snapshot = layout_snapshots_hash.get(root_snapshot_hash['snapshot'])
+                    if layout_snapshot is not None:
+                        root_snapshot_hash['snapshotDeltaSize'] = layout_snapshot['snapshotDeltaSize']
+                        root_snapshot_hash['snapshotDeltaUniqueSize'] = layout_snapshot['snapshotDeltaUniqueSize']
+                    else:
+                        root_snapshot_hash['snapshotDeltaSize'] = -1
+                        root_snapshot_hash['snapshotDeltaUniqueSize'] = -1
+
+                snapshot_hash['rootSnapshotList'] = root_snapshots
+            data['result'][0]['snapshot'] = snapshot_hash
+
+    return data
+
+
+@task(name='vm.resource.pool.get', required=['name'])
+def vm_resource_pool_get(agent, msg):
+    """
+    Get the ResourcePool objects attached to a specific VirtualMachine
+    Example client message would be:
+        {
+            "method":     "vm.resource.pool.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyVM",
+        }
+    """
+    logger.info(
+        '[%s] Getting ResourcePool using VirtualMachine %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the VirtualMachine by it's 'name' property
+    # and get the ResourcePool object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'config.instanceUuid', 'resourcePool'],
+        obj_type=pyVmomi.vim.VirtualMachine,
+        obj_property_name='config.instanceUuid',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_host = [props['resourcePool']]
+
+    # Get a list view of the ResourcePool from this VirtualMachine object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_host)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.ResourcePool,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
     return r
+
+
+@task(name='vm.host.get', required=['name'])
+def vm_host_get(agent, msg):
+    """
+    Get the vSphere host where a Virtual Machine is running on
+    Override the base one which doesnt get the list of properties
+    Example client message would be:
+        {
+            "method":     "vm.host.get",
+            "hostname":   "vc01.example.org",
+            "name":       "vm01.example.org",
+        }
+
+    Example client message requesting additional props would be:
+        {
+            "method":     "vm.host.get",
+            "hostname":   "vc01.example.org",
+            "name":       "vm01.example.org",
+            "properties": [
+                "name",
+                "hardware.cpuInfo.hz"
+            ]
+        }
+
+    Returns:
+        The managed object properties in JSON format
+    """
+    logger.debug(
+        '[%s] Getting host where %s VirtualMachine is running on',
+        agent.host,
+        msg['name']
+    )
+
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'config.instanceUuid', 'runtime.host'],
+        obj_type=pyVmomi.vim.VirtualMachine,
+        obj_property_name='config.instanceUuid',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    props = data['result'][0]
+    vm_name, vm_host = props['name'], props['runtime.host']
+
+    result = {}
+    result['name'] = vm_name
+
+    view_ref = agent.get_list_view(obj=[vm_host])
+    result['host'] = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.HostSystem,
+        path_set=['name']
+    )
+    result['host'] = result['host'][0]['name']
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': data['success'],
+        'msg': data['msg'],
+        'result': [result],
+    }
+
+    return r
+
+
+@task(name='vm.hardware.discover', required=['name'])
+def vm_hardware_discover(agent, msg):
+    """
+    Discover the hardware disks in a Virtual Machine
+    Example client message would be:
+        {
+            "method":     "vm.hardware.disk.discover",
+            "hostname":   "vc01.example.org",
+            "name":       "vm01.example.org"
+        }
+
+    Returns:
+        The managed object properties in JSON format
+    """
+    logger.debug(
+        '[%s] Getting hardware.disk in VirtualMachine %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Property names to be collected
+    properties = ['name', 'config.instanceUuid', 'config.hardware.device']
+
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=properties,
+        obj_type=pyVmomi.vim.VirtualMachine,
+        obj_property_name='config.instanceUuid',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    props = data['result'][0]
+    prop_devices = props['config.hardware.device']
+
+    result = {}
+    result_disk = []
+    result_controller = []
+    for prop_device in prop_devices:
+        if isinstance(prop_device, pyVmomi.vim.vm.device.VirtualDisk):
+            disk = {}
+            for prop in ['unitNumber', 'capacityInKB', 'controllerKey']:
+                disk[prop] = getattr(prop_device, prop, '(null)')
+            disk_backing = getattr(prop_device, 'backing')
+            for prop in ['fileName', 'uuid', 'datastore']:
+                disk[prop] = getattr(disk_backing, prop, '(null)')
+            disk_deviceInfo = getattr(prop_device, 'deviceInfo')
+            for prop in ['label', 'summary']:
+                disk[prop] = getattr(disk_deviceInfo, prop, '(null)')
+            disk['datastore.path'] = disk['datastore'].host[0].mountInfo.path
+            disk['datastore.summary.capacity'] = disk['datastore'].summary.capacity
+            disk['datastore.summary.freeSpace'] = disk['datastore'].summary.freeSpace
+            disk['datastore.summary.uncommitted'] = disk['datastore'].summary.uncommitted
+            disk['datastore'] = disk['datastore'].name
+            result_disk.append(disk)
+
+        if (isinstance(prop_device, pyVmomi.vim.vm.device.VirtualLsiLogicController)
+                or
+                isinstance(prop_device, pyVmomi.vim.vm.device.VirtualLsiLogicSASController)
+                or
+                isinstance(prop_device, pyVmomi.vim.vm.device.ParaVirtualSCSIController)
+                or
+                isinstance(prop_device, pyVmomi.vim.vm.device.VirtualIDEController)
+                or
+                # isinstance(prop_device, pyVmomi.vim.vm.device.VirtualNVMEController)
+                # or
+                isinstance(prop_device, pyVmomi.vim.vm.device.VirtualSATAController)
+                or
+                isinstance(prop_device, pyVmomi.vim.vm.device.VirtualSCSIController)
+                or
+                isinstance(prop_device, pyVmomi.vim.vm.device.VirtualSIOController)
+                or
+                isinstance(prop_device, pyVmomi.vim.vm.device.VirtualAHCIController)
+                or
+                isinstance(prop_device, pyVmomi.vim.vm.device.VirtualBusLogicController)
+        ):
+            controller = {}
+            for prop in ['key', 'controllerKey', 'busNumber', 'unitNumber', 'device']:
+                controller[prop] = getattr(prop_device, prop, '(null)')
+            result_controller.append(controller)
+
+    result['virtualDisk'] = result_disk
+    result['controller'] = result_controller
+
+    r = {
+        'success': data['success'],
+        'msg': data['msg'],
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='vm.net.discover', required=['name'])
+def vm_net_discover(agent, msg):
+    """
+    Discover the NICs in a Virtual Machine
+    Example client message would be:
+        {
+            "method":     "vm.guest.net.discover",
+            "hostname":   "vc01.example.org",
+            "name":       "vm01.example.org"
+        }
+
+    Returns:
+        The managed object properties in JSON format
+    """
+    logger.debug(
+        '[%s] Getting guest.net in VirtualMachine %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Property names to be collected
+    properties = ['name', 'config.instanceUuid', 'guest.net']
+
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=properties,
+        obj_type=pyVmomi.vim.VirtualMachine,
+        obj_property_name='config.instanceUuid',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    props = data['result'][0]
+    prop_devices = props['guest.net']
+
+    result = {}
+    result_nic = []
+    for prop_device in prop_devices:
+        nic = {}
+
+        for prop in ['connected', 'deviceConfigId', 'macAddress', 'ipAddress', 'network']:
+            nic[prop] = getattr(prop_device, prop, 'UNKNOWN')
+
+        result_nic.append(nic)
+
+    result['nic'] = result_nic
+
+    r = {
+        'success': data['success'],
+        'msg': data['msg'],
+        'result': result,
+    }
+
+    return r
+
 
 @task(name='vm.disk.discover', required=['name'])
 def vm_disk_discover(agent, msg):
@@ -1924,12 +848,13 @@ def vm_disk_discover(agent, msg):
     )
 
     # Find the VM and get the guest disks
-    data = _get_object_properties(
+    data = vpoller.vsphere.tasks._get_object_properties(
         agent=agent,
-        properties=['name', 'guest.disk'],
+        properties=['name', 'config.instanceUuid', 'guest.disk'],
         obj_type=pyVmomi.vim.VirtualMachine,
-        obj_property_name='name',
-        obj_property_value=msg['name']
+        obj_property_name='config.instanceUuid',
+        obj_property_value=msg['name'],
+        include_mors=True
     )
 
     if data['success'] != 0:
@@ -1937,7 +862,7 @@ def vm_disk_discover(agent, msg):
 
     # Get the VM name and guest disk properties from the result
     props = data['result'][0]
-    vm_name, vm_disks = props['name'], props['guest.disk']
+    vm_name, vm_disks, vm_obj = props['name'], props['guest.disk'], props['obj']
 
     # Properties to be collected for the guest disks
     properties = ['diskPath']
@@ -1948,6 +873,7 @@ def vm_disk_discover(agent, msg):
     result = {}
     result['name'] = vm_name
     result['disk'] = [{prop: getattr(disk, prop, '(null)') for prop in properties} for disk in vm_disks]
+    result['datastore'] = {'datastore.count': len(vm_obj.datastore)}
 
     r = {
         'success': 0,
@@ -1957,419 +883,11 @@ def vm_disk_discover(agent, msg):
 
     return r
 
-@task(name='vm.guest.net.get', required=['name'])
-def vm_guest_net_get(agent, msg):
+
+@task(name='vm.guestdisk.get', required=['name', 'username', 'password'])
+def vm_guestdisk_get(agent, msg):
     """
-    Discover network adapters for a vim.VirtualMachine  object
-
-    Note, that this request requires you to have
-    VMware Tools installed in order get information about the
-    guest network adapters.
-
-    Example client message would be:
-
-        {
-            "method":   "vm.guest.net.get",
-            "hostname": "vc01.example.org",
-            "name":     "vm01.example.org"
-        }
-
-    Example client message requesting
-    additional properties to be collected:
-
-        {
-            "method":   "vm.guest.net.get",
-            "hostname": "vc01.example.org",
-            "name":     "vm01.example.org",
-            "properties": [
-                "network",
-                "connected",
-                "macAddress",
-                "ipConfig"
-            ]
-        }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    logger.debug(
-        '[%s] Discovering network adapters for VirtualMachine %s',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the VM and get the network adapters
-    data = _get_object_properties(
-        agent=agent,
-        properties=['name', 'guest.net'],
-        obj_type=pyVmomi.vim.VirtualMachine,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    # Get the VM name and network adapters
-    # properties from the result
-    props = data['result'][0]
-    vm_name, vm_networks = props['name'], props['guest.net']
-
-    # Properties to be collected for the guest disks
-    properties = ['network']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    # Get the requested properties
-    result = {}
-    result['name'] = vm_name
-    result['net'] = [{prop: getattr(net, prop, '(null)') for prop in properties} for net in vm_networks]
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully retrieved properties',
-        'result': result,
-    }
-
-    return r
-
-@task(name='vm.net.get', required=['name'])
-def vm_net_get(agent, msg):
-    """
-    Get all Networks used by a vim.VirtualMachine managed object
-
-    Example client message would be:
-
-        {
-            "method":     "vm.net.get",
-            "hostname":   "vc01.example.org",
-            "name":       "vm01.example.org",
-        }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting Networks available for %s VirtualMachine',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the VirtualMachine managed object and
-    # get the 'network' property
-    data = _get_object_properties(
-        agent=agent,
-        properties=['name', 'network'],
-        obj_type=pyVmomi.vim.VirtualMachine,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    props = data['result'][0]
-    vm_name, vm_networks = props['name'], props['network']
-
-    # Create a list view for the Network managed objects
-    view_ref = agent.get_list_view(obj=vm_networks)
-    result = {}
-    result['name'] = vm_name
-    result['network'] = agent.collect_properties(
-        view_ref=view_ref,
-        obj_type=pyVmomi.vim.Network,
-        path_set=['name']
-    )
-
-    view_ref.DestroyView()
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': result,
-    }
-
-    return r
-
-def _get_vm_snapshots(agent, name):
-    """
-    Gets all snapshots for a vim.VirtualMachine object
-
-    Args:
-        agent (VConnector): VConnector instance
-        name         (str): Name of the VirtualMachine object
-
-    Returns:
-        A dict containing the VirtualMachine snaphots
-
-    """
-    logger.info(
-        '[%s] Getting snapshots for %s VirtualMachine',
-        agent.host,
-        name
-    )
-
-    obj = agent.get_object_by_property(
-        property_name='name',
-        property_value=name,
-        obj_type=pyVmomi.vim.VirtualMachine
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object: {}'.format(name)}
-
-    if not obj.snapshot:
-        return {'success': 1, 'msg': 'No snapshots found for: {}'.format(name)}
-
-    snapshots = []
-    for root in obj.snapshot.rootSnapshotList:
-        snapshots.append(root)
-        for child in root.childSnapshotList:
-            snapshots.append(child)
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully retrieved snapshots',
-        'result': snapshots,
-    }
-
-    return r
-
-@task(name='vm.snapshot.get', required=['name'])
-def vm_snapshot_get(agent, msg):
-    """
-    Gets all snapshots for a vim.VirtualMachine managed object
-
-    Example client message would be:
-
-        {
-            "method":     "vm.snapshot.get",
-            "hostname":   "vc01.example.org",
-            "name":       "vm01.example.org",
-        }
-
-    Returns:
-        The discovered snapshots as a JSON object
-
-    """
-    data = _get_vm_snapshots(agent, name=msg['name'])
-    if data['success'] != 0:
-        return data
-
-    result = []
-    for snapshot in data['result']:
-        s = {
-            'createTime': str(snapshot.createTime),
-            'description': snapshot.description,
-            'id': snapshot.id,
-            'name': snapshot.name,
-            'quiesced': str(snapshot.quiesced),
-            'state': snapshot.state,
-        }
-        result.append(s)
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully retrieved snapshots',
-        'result': result,
-    }
-
-    return r
-
-@task(name='vm.get', required=['name', 'properties'])
-def vm_get(agent, msg):
-    """
-    Get properties for a vim.VirtualMachine managed object
-
-    Example client message would be:
-
-        {
-            "method":     "vm.get",
-            "hostname":   "vc01.example.org",
-            "name":       "vm01.example.org",
-            "properties": [
-                "name",
-                "runtime.powerState"
-            ]
-        }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    # Property names to be collected
-    properties = ['name']
-    if 'properties' in msg and msg['properties']:
-        properties.extend(msg['properties'])
-
-    return _get_object_properties(
-        agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.VirtualMachine,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-@task(name='vm.host.get', required=['name'])
-def vm_host_get(agent, msg):
-    """
-    Get the vSphere host where a Virtual Machine is running on
-
-    Example client message would be:
-
-        {
-            "method":     "vm.host.get",
-            "hostname":   "vc01.example.org",
-            "name":       "vm01.example.org",
-        }
-
-    Returns:
-        The managed object properties in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting host where %s VirtualMachine is running on',
-        agent.host,
-        msg['name']
-    )
-
-    data = _get_object_properties(
-        agent=agent,
-        properties=['name', 'runtime.host'],
-        obj_type=pyVmomi.vim.VirtualMachine,
-        obj_property_name='name',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    props = data['result'][0]
-    vm_name, vm_host = props['name'], props['runtime.host']
-
-    result = {
-        'name': vm_name,
-        'host': vm_host.name,
-    }
-
-    r = {
-        'success': data['success'],
-        'msg': data['msg'],
-        'result': [result],
-    }
-
-    return r
-
-@task(name='vm.datastore.get', required=['name'])
-def vm_datastore_get(agent, msg):
-    """
-    Get all Datastores used by a vim.VirtualMachine managed object
-
-    Example client message would be:
-
-        {
-            "method":   "vm.datastore.get",
-            "hostname": "vc01.example.org",
-            "name":     "vm01.example.org",
-        }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    return _object_datastore_get(
-        agent=agent,
-        obj_type=pyVmomi.vim.VirtualMachine,
-        name=msg['name']
-    )
-
-@task(name='vm.disk.get', required=['name'])
-def vm_disk_get(agent, msg):
-    """
-    Get properties for a disk of a vim.VirtualMachine object
-
-    Note, that this request requires you to have
-    VMware Tools installed in order get information about the
-    guest disks.
-
-    Example client message would be:
-
-        {
-            "method":   "vm.disk.get",
-            "hostname": "vc01.example.org",
-            "name":     "vm01.example.org"
-            "key":      "/var"
-        }
-
-    Example client message requesting
-    additional properties to be collected:
-
-        {
-            "method":   "vm.disk.get",
-            "hostname": "vc01.example.org",
-            "name":     "vm01.example.org",
-            "key":      "/var",
-            "properties": [
-                "capacity",
-                "diskPath",
-                "freeSpace"
-            ]
-        }
-
-    Returns:
-        The discovered objects in JSON format
-
-    """
-    logger.debug(
-        '[%s] Getting guest disk info for %s on VirtualMachine %s',
-        agent.host,
-        msg['key'],
-        msg['name']
-    )
-
-    # Discover the VM disks
-    data = vm_disk_discover(agent, msg)
-
-    if data['success'] != 0:
-        return data
-
-    # If we have no key for the disk,
-    # just return the result from discovery
-    if 'key' in msg and msg['key']:
-        disk_path = msg['key']
-    else:
-        return data
-
-    props = data['result'][0]
-    disks = props['disk']
-
-    for disk in disks:
-        if disk['diskPath'] == disk_path:
-            break
-    else:
-        return {
-            'success': 1,
-            'msg': 'Unable to find guest disk %s' % disk_path
-        }
-
-    result = {}
-    result['name'] = msg['name']
-    result['disk'] = disk
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully retrieved properties',
-        'result': [result],
-    }
-
-    return r
-
-@task(name='vm.process.get', required=['name', 'username', 'password'])
-def vm_process_get(agent, msg):
-    """
-    Get processes running on a vim.VirtualMachine managed object
+    Get the guest disks in a vim.VirtualMachine managed object
 
     This method requires you to have VMware Tools installed and
     running in order to get the list of processes running in a
@@ -2378,35 +896,23 @@ def vm_process_get(agent, msg):
     Example client message would be:
 
         {
-            "method":     "vm.process.get",
+            "method":     "vm.guestdisk.get",
             "hostname":   "vc01.example.org",
             "name":       "vm01.example.org",
             "username":   "root",
             "password":   "p4ssw0rd"
         }
 
-    Example client message which requests
-    additional properties for the processes:
-
-        {
-            "method":     "vm.process.get",
-            "hostname":   "vc01.example.org",
-            "name":       "vm01.example.org",
-            "username":   "root",
-            "password":   "p4ssw0rd",
-            "properties": [
-                "name",
-                "owner",
-                "pid"
-            ]
-        }
-
     Returns:
         The managed object properties in JSON format
 
     """
+
+    # temporary no-op for rollout switing to instaneUUID instead of name
+    # return {'success': 1, 'msg': 'temporary disable for rollout'}
+
     logger.debug(
-        '[%s] Getting processes for VirtualMachine %s',
+        '[%s] Getting guestdisks for VirtualMachine %s',
         agent.host,
         msg['name']
     )
@@ -2414,9 +920,10 @@ def vm_process_get(agent, msg):
     # Get the VirtualMachine managed object
     data = _get_object_properties(
         agent=agent,
-        properties=['name', 'guest.toolsRunningStatus'],
+        properties=['name', 'config.instanceUuid', 'runtime.powerState', 'guest.toolsRunningStatus',
+                    'guest.guestFamily'],
         obj_type=pyVmomi.vim.VirtualMachine,
-        obj_property_name='name',
+        obj_property_name='config.instanceUuid',
         obj_property_value=msg['name'],
         include_mors=True
     )
@@ -2426,20 +933,28 @@ def vm_process_get(agent, msg):
 
     # Get the VM properties
     props = data['result'][0]
-    vm_name, vm_tools_is_running, vm_obj = props['name'], props['guest.toolsRunningStatus'], props['obj']
+    vm_name, vm_powerstate, vm_tools_is_running, vm_obj, vm_guestfamily = props['name'], props['runtime.powerState'], \
+                                                                          props['guest.toolsRunningStatus'], props[
+                                                                              'obj'], props['guest.guestFamily']
 
-    # Check if we have VMware Tools installed and running first
-    # as this request depends on it
+    # Check if vm is powered on
+    if vm_powerstate != 'poweredOn':
+        return {
+            'success': 1,
+            'msg': '%s is not powered on' % vm_name
+        }
+
+    # Check if we have VMware Tools installed and running first as this request depends on it
     if vm_tools_is_running != 'guestToolsRunning':
         return {
             'success': 1,
-            'msg': '%s is not running VMware Tools' % msg['name']
+            'msg': '%s is not running VMware Tools' % vm_name
         }
 
     # Prepare credentials used for
     # authentication in the guest system
     if not msg['username'] or not msg['password']:
-        return {'success': 1, 'msg': 'Need username and password for authentication in guest system {}'.format(msg['name'])}
+        return {'success': 1, 'msg': 'Need username and password for authentication in guest system {}'.format(vm_name)}
 
     vm_creds = pyVmomi.vim.vm.guest.NamePasswordAuthentication(
         username=msg['username'],
@@ -2473,122 +988,1300 @@ def vm_process_get(agent, msg):
 
     return r
 
-@task(name='vm.cpu.usage.percent', required=['name'])
-def vm_cpu_usage_percent(agent, msg):
-    """
-    Get the CPU usage in percentage for a VirtualMachine
 
-    NOTE: This task will be gone after the transition to performance counters
+@task(name='vm.perf.metrics.get', required=['name', 'counter-name'])
+def vm_perf_metrics_get(agent, msg):
+    """
+    Get performance metrics for a vim.VirtualMachine managed object
 
     Example client message would be:
 
         {
-            "method":     "vm.cpu.usage.percent",
-            "hostname":   "vc01.example.org",
-            "name":       "vm01.example.org",
+            "method":       "vm.perf.metrics.get",
+            "hostname":     "vc01.example.org",
+            "name":         "vm01.example.org",
+            "counter-name": "cpu.usagemhz.megaHertz"
         }
+
+    For historical performance statistics make sure to pass the
+    performance interval as part of the message, e.g.:
+
+        {
+            "method":       "vm.perf.metrics.get",
+            "hostname":     "vc01.example.org",
+            "name":         "vm01.example.org",
+            "counter-name": "cpu.usage.megaHertz",
+            "perf-interval": "Past day"
+        }
+
+    Returns:
+        The retrieved performance metrics
+
+    """
+
+    obj = agent.get_object_by_property(
+        property_name='config.instanceUuid',
+        property_value=msg['name'],
+        obj_type=pyVmomi.vim.VirtualMachine
+    )
+
+    if not obj:
+        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
+
+    if obj.runtime.powerState != pyVmomi.vim.VirtualMachinePowerState.poweredOn:
+        return {'success': 1, 'msg': 'VM is not powered on, cannot get performance metrics'}
+
+    if obj.runtime.connectionState != pyVmomi.vim.VirtualMachineConnectionState.connected:
+        return {'success': 1, 'msg': 'VM is not connected, cannot get performance metrics'}
+
+    try:
+        counter_name = msg.get('counter-name')
+        max_sample = int(msg.get('max-sample')) if msg.get('max-sample') else 1
+        interval_name = msg.get('perf-interval')
+        instance = msg.get('instance') if msg.get('instance') else ''
+    except (TypeError, ValueError):
+        logger.warning('Invalid message, cannot retrieve performance metrics')
+        return {
+            'success': 1,
+            'msg': 'Invalid message, cannot retrieve performance metrics'
+        }
+
+    ret = _entity_perf_metrics_get(
+        agent=agent,
+        entity=obj,
+        counter_name=counter_name,
+        max_sample=max_sample,
+        instance=instance,
+        interval_name=interval_name
+    )
+
+    if counter_name.startswith('virtualDisk.'):
+        disk_info = vm_hardware_discover(agent, {'name': msg['name']})
+        if disk_info['success'] != 0:
+            return disk_info
+
+        for metric in ret['result']:
+            for controller in disk_info['result']['controller']:
+                for disk in disk_info['result']['virtualDisk']:
+                    if controller['key'] == disk['controllerKey'] and metric['instance'] == (
+                            'scsi' + str(controller['busNumber']) + ':' + str(disk['unitNumber'])):
+                        metric['uuid'] = disk['uuid']
+                        metric['label'] = disk['label']
+                        metric['summary'] = disk['summary']
+                        metric['fileName'] = disk['fileName']
+                        metric['capacityInKB'] = disk['capacityInKB']
+                        metric['datastore'] = disk['datastore']
+                        metric['datastore.path'] = disk['datastore.path']
+                        metric['datastore.summary.capacity'] = disk['datastore.summary.capacity']
+                        metric['datastore.summary.freeSpace'] = disk['datastore.summary.freeSpace']
+                        metric['datastore.summary.uncommitted'] = disk['datastore.summary.uncommitted']
+    elif counter_name.startswith('net.'):
+        # filter out vmnic* instances which are the underlying hypervisors nics and this vm's usage of them
+        device_info = vm_net_discover(agent, {'name': msg['name']})
+        if device_info['success'] != 0:
+            return device_info
+
+        device_info_by_config_id = {}
+        for dev_info in device_info['result']['nic']:
+            device_info_by_config_id[str(dev_info['deviceConfigId'])] = dev_info
+
+        result_new = []
+        for metric in ret['result']:
+            if not metric['instance'].startswith('vmnic'):
+                result_new.append(metric)
+                dev = device_info_by_config_id.get(metric['instance'])
+                if dev is None:
+                    dev = {'macAddress': 'UNKNOWN', 'ipAddress': ['UNKNOWN'], 'connected': 'UNKNOWN',
+                           'deviceConfigId': 'UNKNOWN', 'network': 'UNKNOWN'}
+                metric['macAddress'] = dev['macAddress']
+                metric['network'] = dev['network']
+                metric['connected'] = dev['connected']
+                metric['ipAddress'] = dev['ipAddress']
+
+        ret['result'] = result_new
+
+    # get resource pool...
+    view_ref = agent.get_list_view(obj=[obj])
+    try:
+        data = agent.collect_properties(
+            view_ref=view_ref,
+            obj_type=pyVmomi.vim.VirtualMachine,
+            path_set=['config.instanceUuid', 'resourcePool'],
+            include_mors=False
+        )
+
+        resource_pool = 'UNKNOWN'
+        for d in data:
+            resource_pool = d.get('resourcePool')
+            if resource_pool is not None:
+                resource_pool = resource_pool.name
+                break
+
+        for metric in ret['result']:
+            metric['resourcePool'] = resource_pool
+    except Exception as e:
+        return {'success': 1, 'msg': 'Cannot collect properties (resourcepool): {}'.format(e.message)}
+
+    view_ref.DestroyView()
+
+    return ret
+
+
+# @task(name='host.get', required=['name', 'properties'])
+# def host_get(agent, msg):
+#    logger.info('properties: ' + str(msg['properties']))
+#
+#    return vpoller.vsphere.tasks.host_get(agent,msg)
+
+@task(name='host.get', required=['name', 'properties'])
+def host_get(agent, msg):
+    """
+    Get properties of a single vim.HostSystem managed object
+
+    Example client message would be:
+
+    {
+        "method":     "host.get",
+        "hostname":   "vc01.example.org",
+        "name":       "esxi01.example.org",
+        "properties": [
+            "name",
+            "runtime.powerState"
+        ]
+
 
     Returns:
         The managed object properties in JSON format
 
     """
-    logger.debug(
-        '[%s] Getting CPU usage percentage for VirtualMachine %s',
+
+    # Property names to be collected
+    properties = ['name']
+    if 'properties' in msg and msg['properties']:
+        properties.extend(msg['properties'])
+
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=properties,
+        obj_type=pyVmomi.vim.HostSystem,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data.get('result') is not None:
+        if 'vm' in properties:
+            vms = []
+            vms_data = data['result'][0].get('vm')
+            if vms_data is None:
+                vms_data = []
+            for vm in vms_data:
+                vms.append(vm.name)
+
+            data['result'][0]['vm'] = vms
+
+        if 'parent' in properties:
+            parent = data['result'][0].get('parent')
+            if parent is not None:
+                data['result'][0]['parent'] = parent.name
+            else:
+                data['result'][0]['parent'] = ''
+
+        if 'triggeredAlarmState' in properties:
+            triggeredAlarmState = data['result'][0].get('triggeredAlarmState')
+
+            alarms = []
+            alarm_count = 0
+            alarms_filtered = []
+            alarm_filtered_count = 0
+            if triggeredAlarmState is not None:
+
+                filteredAlarms = [
+                    re.compile('^Host CPU usage$', re.IGNORECASE),
+                    re.compile('^Host memory usage$', re.IGNORECASE),
+                ]
+
+                for triggeredAlarm in triggeredAlarmState:
+                    alarm_name = triggeredAlarm.alarm.info.name
+                    alarm_desc = triggeredAlarm.alarm.info.description
+                    entity = triggeredAlarm.entity.name
+                    key = triggeredAlarm.key
+                    filtered = False
+                    for filteredAlarm in filteredAlarms:
+                        if filteredAlarm.match(alarm_name):
+                            filtered = True
+                            alarm_filtered_count += 1
+                            alarms_filtered.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+                            break
+                    if filtered:
+                        continue
+                    else:
+                        alarm_count += 1
+                        alarms.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+
+                data['result'][0]['triggeredAlarmState'] = '\n'.join(alarms)
+                data['result'][0]['triggeredAlarmFilteredState'] = '\n'.join(alarms_filtered)
+            else:
+                data['result'][0]['triggeredAlarmState'] = ''
+                data['result'][0]['triggeredAlarmFilteredState'] = ''
+
+            data['result'][0]['triggeredAlarmCount'] = alarm_count
+            data['result'][0]['triggeredAlarmFilteredCount'] = alarm_filtered_count
+
+    return data
+
+
+@task(name='host.log.info', required=['name', 'properties'])
+def host_log_info(agent, msg):
+    """
+    Get log info of a single vim.HostSystem managed object
+
+    Example client message would be:
+
+    {
+        "method":     "host.log.info",
+        "hostname":   "vc01.example.org",
+        "name":       "esxi01.example.org",
+        "properties": [
+            "name",
+            "runtime.powerState"
+        ]
+    }
+
+    Returns:
+        The logfile info in JSON
+
+    """
+
+    obj = agent.get_object_by_property(
+        property_name='name',
+        property_value=msg['name'],
+        obj_type=pyVmomi.vim.HostSystem
+    )
+
+    diagmgr = agent.si.content.diagnosticManager
+    log = diagmgr.QueryDescriptions(host=obj)
+    result = []
+    for l in log:
+        result.append({'key': l.key, 'fileName': l.fileName})
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='host.log.get', required=['name', 'properties'])
+def host_log_get(agent, msg):
+    """
+    Get log of a single vim.HostSystem managed object
+
+    Example client message would be:
+
+    {
+        "method":     "host.log.get",
+        "hostname":   "vc01.example.org",
+        "name":       "esxi01.example.org",
+        "properties": [
+            "name",
+            "runtime.powerState"
+        ]
+    }
+
+    Returns:
+        The logfile content in JSON
+
+    """
+
+    obj = agent.get_object_by_property(
+        property_name='name',
+        property_value=msg['name'],
+        obj_type=pyVmomi.vim.HostSystem
+    )
+
+    diagmgr = agent.si.content.diagnosticManager
+    log = diagmgr.QueryDescriptions(host=obj)
+    result = []
+    for prop in msg['properties']:
+        log = diagmgr.BrowseDiagnosticLog(host=obj, key=prop, start=999999999)
+        logging.info('log:' + str(log))
+        lines = log.lineEnd
+
+        lineText = []
+        i = 1
+        while i < lines:
+            log_segment = diagmgr.BrowseDiagnosticLog(host=obj, key=prop, start=i, lines=i + 999)
+            lineText.extend(log_segment.lineText)
+            i += 999
+        result.append({prop: {'lineStart': 1, 'lineEnd': lines, 'lineText': lineText}})
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='host.perf.metrics.get', required=['name', 'counter-name'])
+def host_perf_metrics_get(agent, msg):
+    """
+    Get performance metrics for a vim.HostSystem managed object
+
+    Example client message would be:
+
+    {
+        "method":       "host.perf.metrics.get",
+        "hostname":     "vc01.example.org",
+        "name":         "esxi01.example.org",
+        "counter-name": "net.usage.kiloBytesPerSecond",
+        "instance":     "vmnic0",
+        "max_sample": 1
+    }
+
+    Returns:
+        The retrieved performance metrics
+
+    """
+    obj = agent.get_object_by_property(
+        property_name='name',
+        property_value=msg['name'],
+        obj_type=pyVmomi.vim.HostSystem
+    )
+
+    if not obj:
+        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
+
+    if obj.runtime.powerState != pyVmomi.vim.HostSystemPowerState.poweredOn:
+        return {'success': 1, 'msg': 'Host is not powered on, cannot get performance metrics'}
+
+    if obj.runtime.connectionState != pyVmomi.vim.HostSystemConnectionState.connected:
+        return {'success': 1, 'msg': 'Host is not connected, cannot get performance metrics'}
+
+    try:
+        counter_name = msg.get('counter-name')
+        max_sample = int(msg.get('max-sample')) if msg.get('max-sample') else 1
+        interval_name = msg.get('perf-interval')
+        instance = msg.get('instance') if msg.get('instance') else ''
+    except (TypeError, ValueError):
+        logger.warning('Invalid message, cannot retrieve performance metrics')
+        return {
+            'success': 1,
+            'msg': 'Invalid message, cannot retrieve performance metrics'
+        }
+
+    return _entity_perf_metrics_get(
+        agent=agent,
+        entity=obj,
+        counter_name=counter_name,
+        max_sample=max_sample,
+        instance=instance,
+        interval_name=interval_name
+    )
+
+
+@task(name='vm.datacenter.get', required=['name'])
+def vm_datacenter_get(agent, msg):
+    """
+    Get the Datacenter object attached to a specific VirtualMachine
+    Example client message would be:
+        {
+            "method":     "vm.datacenter.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyVM",
+        }
+    """
+    logger.info(
+        '[%s] Getting Datacenter using VirtualMachine %s',
         agent.host,
         msg['name']
     )
 
-    # Get the VirtualMachine managed object and collect the
-    # properties required to calculate the CPU usage percentage.
-    # The CPU usage in percentage is directly related to the
-    # host the where the Virtual Machine is running on,
-    # so we need to collect the 'runtime.host' property as well.
-    required_properties = [
-        'name',
-        'runtime.host',
-        'summary.quickStats.overallCpuUsage',
-        'config.hardware.numCoresPerSocket',
-        'config.hardware.numCPU',
-    ]
-
-    data = _get_object_properties(
+    # Find the VirtualMachine by it's 'name' property
+    # and get the Datacenter object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
         agent=agent,
-        properties=required_properties,
+        properties=['name', 'config.instanceUuid', 'parent'],
         obj_type=pyVmomi.vim.VirtualMachine,
-        obj_property_name='name',
-        obj_property_value=msg['name'],
+        obj_property_name='config.instanceUuid',
+        obj_property_value=msg['name']
     )
 
     if data['success'] != 0:
         return data
 
-    # Get the VM properties
+    # Get properties from the result
     props = data['result'][0]
+    obj_datacenter = props['parent']
 
-    # TODO: A fix for VMware vSphere 4.x versions, where not
-    #       always the properties requested are returned by the
-    #       vCenter server, which could result in a KeyError
-    #       exception. See this issue for more details:
-    #
-    #           - https://github.com/dnaeon/py-vpoller/issues/33
-    #
-    #       We should ensure that vPoller Workers do not fail
-    #       under such circumstances and return an error message.
-    if not all(p in props for p in required_properties):
-        return {
-            'success': 1,
-            'msg': 'Unable to retrieve required properties'
-        }
+    # walk the parent heirarchy until the datacenter parent is found
+    obj_datacenter = [_parent_recurse(obj_datacenter, 'pyVmomi.VmomiSupport.vim.Datacenter')]
 
-    # Calculate CPU usage in percentage
-    # The overall CPU usage returned by vSphere is in MHz, so
-    # we first convert it back to Hz and then calculate percentage
-    cpu_usage = (
-        float(props['summary.quickStats.overallCpuUsage'] * 1048576) /
-        (props['runtime.host'].hardware.cpuInfo.hz * props['config.hardware.numCoresPerSocket'] *
-         props['config.hardware.numCPU']) *
-        100
+    # Get a list view of the Datacenter from this VirtualMachine object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_datacenter)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.Datacenter,
+        path_set=['name']
     )
 
-    result = {
-        'name': props['name'],
-        'vm.cpu.usage.percent': cpu_usage
-    }
+    view_ref.DestroyView()
 
     r = {
         'success': 0,
-        'msg': 'Successfully retrieved properties',
-        'result': [result],
+        'msg': 'Successfully discovered objects',
+        'result': result,
     }
 
     return r
 
-@task(name='datastore.discover')
-def datastore_discover(agent, msg):
+
+@task(name='host.datacenter.get', required=['name'])
+def host_datacenter_get(agent, msg):
     """
-    Discover all pyVmomi.vim.Datastore managed objects
+    Get the Datacenter object attached to a specific HostSystem
+    Example client message would be:
+        {
+            "method":     "host.datacenter.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyHostSystem",
+        }
+    """
+    logger.info(
+        '[%s] Getting Datacenter using HostSystem %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the HostSystem by it's 'name' property
+    # and get the Datacenter object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'parent'],
+        obj_type=pyVmomi.vim.HostSystem,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_datacenter = props['parent']
+
+    # walk the parent heirarchy until the datacenter parent is found
+    obj_datacenter = [_parent_recurse(obj_datacenter, 'pyVmomi.VmomiSupport.vim.Datacenter')]
+
+    # Get a list view of the Datacenter from this VirtualMachine object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_datacenter)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.Datacenter,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='host.multipathinfo.get', required=['name'])
+def host_multipathinfo_get(agent, msg):
+    """
+    Get the HostMultipathStateInfoPath objects attached to a specific HostSystem
+    Example client message would be:
+        {
+            "method":     "host.multipath.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyHostSystem",
+        }
+    """
+    logger.info(
+        '[%s] Getting HostMultipath using HostSystem %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the HostSystem by it's 'name' property
+    # and get the HostConfigInfo object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'config.storageDevice.multipathInfo.lun'],
+        obj_type=pyVmomi.vim.HostSystem,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+
+    obj_multipathinfo = props['config.storageDevice.multipathInfo.lun']
+
+    result = [{prop: getattr(lun, prop, '(null)') for prop in ['id', 'path', 'lun', 'policy', 'storageArrayTypePolicy']}
+              for lun in obj_multipathinfo]
+    result2 = []
+    for r in result:
+        lun_paths = []
+        is_working_count = 0
+        active_count = 0
+        standby_count = 0
+        disabled_count = 0
+        dead_count = 0
+        unknown_count = 0
+        for path in r['path']:
+            p = {prop: getattr(path, prop, '(null)') for prop in ['key', 'name', 'state', 'isWorkingPath', 'adapter']}
+            if p['isWorkingPath'] == True:
+                is_working_count += 1
+            if p['state'] == 'active':
+                active_count += 1
+            elif p['state'] == 'standby':
+                standby_count += 1
+            elif p['state'] == 'disabled':
+                disabled_count += 1
+            elif p['state'] == 'dead':
+                dead_count += 1
+            elif p['state'] == 'unknown':
+                unknown_count += 1
+            transport = getattr(path, 'transport', '(null)')
+            p['transportPortWorldWideName'] = getattr(transport, 'portWorldWideName', '(null)')
+            p['transportNodeWorldWideName'] = getattr(transport, 'nodeWorldWideName', '(null)')
+            p['lun'] = r['lun']
+            p['lunid'] = r['id']
+            p['policy'] = r['policy'].policy
+            p['storageArrayTypePolicy'] = r['storageArrayTypePolicy'].policy
+            lun_paths.append(p)
+        for lun_path in lun_paths:
+            lun_path['pathCount'] = len(lun_paths)
+            lun_path['pathCountIsWorking'] = is_working_count
+            lun_path['pathCountStateActive'] = active_count
+            lun_path['pathCountStateStandby'] = standby_count
+            lun_path['pathCountStateDisabled'] = disabled_count
+            lun_path['pathCountStateDead'] = dead_count
+            lun_path['pathCountStateUnknown'] = unknown_count
+            result2.append(lun_path)
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result2,
+    }
+
+    return r
+
+
+@task(name='host.multipathinfo.summary', required=['name'])
+def host_multipathinfo_summary(agent, msg):
+    """
+    Get the HostMultipathStateInfoPath objects attached to a specific HostSystem and generate a summary
+    Example client message would be:
+        {
+            "method":     "host.multipath.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyHostSystem",
+        }
+    """
+    logger.info(
+        '[%s] Getting HostMultipath Summary using HostSystem %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the HostSystem by it's 'name' property
+    # and get the HostConfigInfo object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'config.storageDevice.scsiLun', 'config.fileSystemVolume.mountInfo', 'datastore',
+                    'summary.host', 'config.storageDevice.plugStoreTopology.device',
+                    'config.storageDevice.plugStoreTopology.path', 'config.storageDevice.plugStoreTopology.adapter',
+                    'config.multipathState.path'],
+        obj_type=pyVmomi.vim.HostSystem,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+
+    # lookup cache
+    cache_file = '/var/log/vpoller'
+    for path_part in ['vpoller_trapper', msg['method'], msg['hostname'], msg['name']]:
+        cache_file = cache_file + '/' + path_part
+        if not os.path.exists(cache_file):
+            os.makedirs(cache_file)
+    cache_file = cache_file + '/lun_disk_datastore_mapping.json'
+
+    lun_disk_datastore_mapping = None
+    if os.path.exists(cache_file):
+        with open(cache_file) as lun_disk_datastore_mapping_file:
+            try:
+                lun_disk_datastore_mapping = json.load(lun_disk_datastore_mapping_file)
+            except ValueError as e:
+                lun_disk_datastore_mapping = None  # force it to be over-written
+                logger.info('Problem reading lun_disk_datastore_mapping file: ' + cache_file)
+
+    current_time = int(time.time())
+    disk_without_volume = None
+    volume_without_datastore = None
+    if lun_disk_datastore_mapping is None or lun_disk_datastore_mapping['expires'] < current_time:
+        disk_without_volume = {}
+        volume_without_datastore = {}
+
+        # build volpath:datastore dict
+        datastore_by_volpath = {}
+        obj_host = props['summary.host']
+        obj_datastores = props['datastore']
+        for obj_datastore in obj_datastores:
+            for mountInfo in obj_datastore.host:
+                if mountInfo.key == obj_host:
+                    datastore_by_volpath[mountInfo.mountInfo.path] = obj_datastore.name
+                    break
+
+        # build diskname:volpath dict
+        volpath_by_diskname = {}
+        vols = props['config.fileSystemVolume.mountInfo']
+        for vol in vols:
+            extents = getattr(getattr(vol, 'volume'), 'extent', '(null)')
+            if extents != '(null)':
+                for extent in extents:
+                    volpath_by_diskname[getattr(extent, 'diskName', '(null)')] = getattr(getattr(vol, 'mountInfo'),
+                                                                                         'path', '(null)')
+
+        # build lun:diskname dict
+        diskname_by_lun = {}
+        luns = props['config.storageDevice.scsiLun']
+        for lun in luns:
+            lun_key = getattr(lun, 'key', '(null)')
+            diskname_by_lun[lun_key] = {'diskName': getattr(lun, 'canonicalName', '(null)')}
+            diskname_by_lun[lun_key]['volPath'] = volpath_by_diskname.get(diskname_by_lun[lun_key]['diskName'])
+            if diskname_by_lun[lun_key]['volPath'] is None:
+                disk_without_volume[lun_key] = True
+
+                diskname_by_lun[lun_key]['volPath'] = 'No Volume Associated (mapping cache refresh every hour)'
+                diskname_by_lun[lun_key][
+                    'datastore'] = 'No Volume/Datastore Associated (Mapping cache refresh every hour)'
+            else:
+                disk_without_volume[lun_key] = False
+
+                diskname_by_lun[lun_key]['datastore'] = datastore_by_volpath.get(diskname_by_lun[lun_key]['volPath'])
+                if diskname_by_lun[lun_key]['datastore'] is None:
+                    volume_without_datastore[lun_key] = True
+                    diskname_by_lun[lun_key]['datastore'] = 'No Datastore Associated (mapping cache refresh every hour)'
+                else:
+                    volume_without_datastore[lun_key] = False
+
+        # write mapping to a file
+        with open(cache_file, 'w') as lun_disk_datastore_mapping_file:
+            cache = {'expires': (current_time + random.randint(1800, 3600)), 'diskname_by_lun': diskname_by_lun}
+            json.dump(cache, lun_disk_datastore_mapping_file)
+
+    else:
+        diskname_by_lun = lun_disk_datastore_mapping['diskname_by_lun']
+
+    # check the paths...
+    plugstore_paths = props['config.storageDevice.plugStoreTopology.path']
+    path_by_key = {}
+    for plugstore_path in plugstore_paths:
+        path_by_key[getattr(plugstore_path, 'key')] = {prop: getattr(plugstore_path, prop) for prop in
+                                                       ['key', 'name', 'adapter']}
+
+    pathstates = props['config.multipathState.path']
+    pathstate_by_name = {}
+    for pathstate in pathstates:
+        pathstate_by_name[getattr(pathstate, 'name')] = {prop: getattr(pathstate, prop) for prop in
+                                                         ['name', 'pathState']}
+
+    adapters = props['config.storageDevice.plugStoreTopology.adapter']
+    adapter_by_key = {}
+    for adapter in adapters:
+        adapter_by_key[getattr(adapter, 'key')] = {prop: getattr(adapter, prop) for prop in ['adapter']}
+
+    plugstore_devices = props['config.storageDevice.plugStoreTopology.device']
+
+    total_count = 0
+    active_count = 0
+    standby_count = 0
+    standby_list = []
+    disabled_count = 0
+    disabled_list = []
+    dead_count = 0
+    dead_list = []
+    unknown_count = 0
+    unknown_list = []
+    disk_without_volume_count = 0
+    disk_without_volume_list = []
+    volume_without_datastore_count = 0
+    volume_without_datastore_list = []
+
+    unbalanced_pathing_count = 0
+    unbalanced_pathing_list = []
+    for plugstore_device in plugstore_devices:
+        lun = getattr(plugstore_device, 'lun')
+
+        path_log = []
+        path_log.append('Datastore: ' + diskname_by_lun[lun]['datastore'])
+        path_log.append('VolumePath: ' + diskname_by_lun[lun]['volPath'])
+        path_log.append('DiskName: ' + diskname_by_lun[lun]['diskName'])
+        path_log.append('LUN: ' + lun)
+
+        path_details = {'by_hba': {}, 'active_path_count': 0, 'standby_path_count': 0, 'disabled_path_count': 0,
+                        'dead_path_count': 0, 'unknown_path_count': 0, 'not_working_path_count': 0,
+                        'working_path_count': 0, 'unbalanced_path_count': 0, 'unbalanced_reason': [],
+                        'adapter_count': 0}
+
+        for path in getattr(plugstore_device, 'path'):
+
+            plugstore_path = path_by_key[path]
+            state = pathstate_by_name[plugstore_path['name']]
+
+            p = {'key': plugstore_path['key'], 'name': plugstore_path['name'],
+                 'adapter': adapter_by_key[plugstore_path['adapter']]['adapter'], 'state': state['pathState']}
+
+            total_count += 1
+
+            path_string = ('(' + p['state'] + ') ').rjust(12) + p['name']
+            if path_details['by_hba'].get(p['adapter']) is None:
+                path_details['by_hba'][p['adapter']] = {'lun': lun, 'adapterType': p['adapter'], 'path_count': 1,
+                                                        'paths': [path_string]}
+                if p['adapter'].startswith('key-vim.host.FibreChannelHba'):
+                    path_details['adapter_count'] += 1
+            else:
+                path_details['by_hba'][p['adapter']]['path_count'] += 1
+                path_details['by_hba'][p['adapter']]['paths'].append(path_string)
+
+            if p['state'] == 'active':
+                active_count += 1
+                path_details['active_path_count'] += 1
+            elif p['state'] == 'standby':
+                standby_count += 1
+                path_details['standby_path_count'] += 1
+            elif p['state'] == 'disabled':
+                disabled_count += 1
+                path_details['disabled_path_count'] += 1
+            elif p['state'] == 'dead':
+                dead_count += 1
+                path_details['dead_path_count'] += 1
+            elif p['state'] == 'unknown':
+                unknown_count += 1
+                path_details['unknown_path_count'] += 1
+
+        running_path_count = -1
+        for adapter, path_hash in path_details['by_hba'].iteritems():
+            path_log.append('\tHBA: ' + adapter)
+            for path in path_hash['paths']:
+                path_log.append('\t\t' + path)
+
+            if adapter.startswith('key-vim.host.FibreChannelHba'):
+                # if path_hash['path_count'] > 2:
+                #    path_details['unbalanced_path_count'] += 1
+                #    path_details['unbalanced_reason'].append('Over2PathsPerHBA_'+adapter)
+
+                if path_hash['path_count'] % 2 != 0:
+                    path_details['unbalanced_path_count'] += 1
+                    path_details['unbalanced_reason'].append('OddNumberOfPathsOn_' + adapter)
+                else:
+                    if running_path_count < 0:
+                        running_path_count = path_hash['path_count']
+                    else:
+                        if running_path_count != path_hash['path_count']:
+                            path_details['unbalanced_path_count'] += 1
+                            path_details['unbalanced_reason'].append('UnbalancedPathsCountAcrossAllHBAs')
+        if path_details['adapter_count'] % 2 != 0:
+            path_details['unbalanced_path_count'] += 1
+            path_details['unbalanced_reason'].append('OddNumberOfHBAs_' + str(path_details['adapter_count']))
+
+        path_log.append('')
+
+        if path_details['standby_path_count'] > 0:
+            standby_list.extend(path_log)
+        if path_details['disabled_path_count'] > 0:
+            disabled_list.extend(path_log)
+        if path_details['dead_path_count'] > 0:
+            dead_list.extend(path_log)
+        if path_details['unknown_path_count'] > 0:
+            unknown_list.extend(path_log)
+        if path_details['unbalanced_path_count'] > 0 or path_details['adapter_count'] % 2 != 0:
+            unbalanced_pathing_count += 1
+            reasons = ':::'.join(path_details['unbalanced_reason'])
+            unbalanced_pathing_list.append('Problems: ' + reasons)
+            unbalanced_pathing_list.extend(path_log)
+
+        if disk_without_volume is not None and disk_without_volume[lun]:
+            disk_without_volume_count += 1
+            disk_without_volume_list.extend(path_log)
+
+        if volume_without_datastore is not None and disk_without_volume[lun] == False and volume_without_datastore[lun]:
+            volume_without_datastore_count += 1
+            volume_without_datastore_list.extend(path_log)
+
+    result = [{
+        'storagePath.summary.totalPathCount': total_count,
+        'storagePath.summary.activePathCount': active_count,
+        'storagePath.summary.standbyPathCount': standby_count,
+        'storagePath.summary.standbyPaths': '\n'.join(standby_list),
+        'storagePath.summary.disabledPathCount': disabled_count,
+        'storagePath.summary.disabledPaths': '\n'.join(disabled_list),
+        'storagePath.summary.deadPathCount': dead_count,
+        'storagePath.summary.deadPaths': '\n'.join(dead_list),
+        'storagePath.summary.unknownPathCount': unknown_count,
+        'storagePath.summary.unknownPaths': '\n'.join(unknown_list),
+        'storagePath.summary.unbalancedPathCount': unbalanced_pathing_count,
+        'storagePath.summary.unbalancedPaths': '\n'.join(unbalanced_pathing_list)
+    }]
+
+    if disk_without_volume is not None:
+        result[0]['storage_orphans_disks_without_volume'] = '\n'.join(disk_without_volume_list)
+        result[0]['storage_orphans_disks_without_volume_count'] = disk_without_volume_count
+        result[0]['storage_orphans_volumes_without_datastore'] = '\n'.join(volume_without_datastore_list)
+        result[0]['storage_orphans_volumes_without_datastore_count'] = volume_without_datastore_count
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='host.cpupkg.get', required=['name'])
+def host_cpupkg_get(agent, msg):
+    """
+    Get all HostCpuPackage objects attached to a specific HostSystem
+    Example client message would be:
+        {
+            "method":     "host.cpupkg.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyHost",
+        }
+    """
+    logger.info(
+        '[%s] Getting HostCpuPackage list using HostSystem %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the HostSystem by it's 'name' property
+    # and get the HostCpuPackage objects using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'hardware.cpuPkg'],
+        obj_type=pyVmomi.vim.HostSystem,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_cpupkg = props['hardware.cpuPkg']
+
+    result = []
+    for cpupkg in obj_cpupkg:
+        result.append(
+            {'description': cpupkg.description, 'vendor': cpupkg.vendor, 'busHz': cpupkg.busHz, 'hz': cpupkg.hz,
+             'index': cpupkg.index, 'threadId': cpupkg.threadId})
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+def cluster_zone(cluster_name):
+    if re.match('^........C', cluster_name) or re.match('^........H', cluster_name) or re.match('^........X',
+                                                                                                cluster_name) or re.match(
+            '^........Y', cluster_name):
+        cluster_zone = 'IZ'
+    elif re.match('^........D', cluster_name):
+        cluster_zone = 'DZ'
+    elif re.match('^........M', cluster_name):
+        cluster_zone = 'MZ'
+    else:
+        cluster_zone = 'Unknown'
+
+    return cluster_zone
+
+
+@task(name='cluster.get', required=['name', 'properties'])
+def cluster_get(agent, msg):
+    """
+    Get properties of a vim.ClusterComputeResource managed object
 
     Example client message would be:
 
-        {
-            "method":   "datastore.discover",
-            "hostname": "vc01.example.org",
-        }
-
-    Example client message which also requests
-    additional properties:
-
-        {
-            "method":     "datastore.discover",
-            "hostname":   "vc01.example.org",
+    {
+        "method":     "cluster.get",
+        "hostname":   "vc01.example.org",
+            "name":       "MyCluster",
             "properties": [
-                "name",
-                "summary.url"
-            ]
-        }
+            "name",
+            "overallStatus"
+        ]
+    }
 
     Returns:
-        The discovered objects in JSON format
+        The managed object properties in JSON format
+
+    """
+
+    # Property names to be collected
+    properties = ['name']
+    if 'properties' in msg and msg['properties']:
+        properties.extend(msg['properties'])
+
+    host_vm = False
+    if 'host.vm' in properties:
+        properties.remove('host.vm')
+        host_vm = True
+
+    if 'cluster.zone' in properties:
+        properties.remove('cluster.zone')
+
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=properties,
+        obj_type=pyVmomi.vim.ClusterComputeResource,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data.get('result') is not None:
+        if 'cluster.zone' in msg['properties']:
+            data['result'][0]['cluster.zone'] = cluster_zone(msg['name'])
+
+        if 'host' in properties:
+            hosts = []
+            vms = []
+            hosts_data = data['result'][0].get('host')
+            if hosts_data is None:
+                hosts_data = []
+            for host in hosts_data:
+                hosts.append(host.name)
+
+                if host_vm:
+                    # for vm in host.vm:
+                    #    vms.append(vm.name)
+
+                    # this is faster by far than just walking the path....
+                    data_host = vpoller.vsphere.tasks._get_object_properties(
+                        agent=agent,
+                        properties=['name', 'vm'],
+                        obj_type=pyVmomi.vim.HostSystem,
+                        obj_property_name='name',
+                        obj_property_value=host.name
+                    )
+                    if data_host.get('result') is not None:
+                        for vm in data_host['result'][0]['vm']:
+                            vms.append(vm.name)
+
+            data['result'][0]['host'] = hosts
+            if host_vm:
+                data['result'][0]['host.vm'] = vms
+
+        if 'triggeredAlarmState' in properties:
+            triggeredAlarmState = data['result'][0].get('triggeredAlarmState')
+
+            alarms = []
+            alarm_count = 0
+            alarms_filtered = []
+            alarm_filtered_count = 0
+            if triggeredAlarmState is not None:
+
+                filteredAlarms = [
+                    re.compile('^Host CPU usage$', re.IGNORECASE),
+                    re.compile('^Host memory usage$', re.IGNORECASE),
+                    re.compile('^Virtual machine CPU usage$', re.IGNORECASE),
+                    re.compile('^Virtual machine memory usage$', re.IGNORECASE),
+                    re.compile('^Deploying a Virtual Machine$', re.IGNORECASE),
+                ]
+
+                for triggeredAlarm in triggeredAlarmState:
+                    alarm_name = triggeredAlarm.alarm.info.name
+                    alarm_desc = triggeredAlarm.alarm.info.description
+                    entity = triggeredAlarm.entity.name
+                    key = triggeredAlarm.key
+                    filtered = False
+                    for filteredAlarm in filteredAlarms:
+                        if filteredAlarm.match(alarm_name):
+                            filtered = True
+                            alarm_filtered_count += 1
+                            alarms_filtered.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+                            break
+                    if filtered:
+                        continue
+                    else:
+                        alarm_count += 1
+                        alarms.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+
+                data['result'][0]['triggeredAlarmState'] = '\n'.join(alarms)
+                data['result'][0]['triggeredAlarmFilteredState'] = '\n'.join(alarms_filtered)
+            else:
+                data['result'][0]['triggeredAlarmState'] = ''
+                data['result'][0]['triggeredAlarmFilteredState'] = ''
+
+            data['result'][0]['triggeredAlarmCount'] = alarm_count
+            data['result'][0]['triggeredAlarmFilteredCount'] = alarm_filtered_count
+
+    return data
+
+
+@task(name='cluster.host.get', required=['name'])
+def cluster_host_get(agent, msg):
+    """
+    Get all HostSystem objects attached to a specific Cluster
+    Example client message would be:
+        {
+            "method":     "cluster.host.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyCluster",
+        }
+    """
+    logger.info(
+        '[%s] Getting HostSystem list using Cluster %s',
+        agent.host,
+        msg['name']
+    )
+
+    obj = agent.get_object_by_property(
+        property_name='name',
+        property_value=msg['name'],
+        obj_type=pyVmomi.vim.ClusterComputeResource
+    )
+
+    if not obj:
+        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
+
+    hosts = []
+    vms = []
+    for host in obj.host:
+        hosts.append(host.name)
+        for vm in host.vm:
+            vms.append(vm.name)
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='cluster.resource.pool.get', required=['name'])
+def cluster_resource_pool_get(agent, msg):
+    """
+    Get the ResourcePool objects attached to a specific Cluster
+    Example client message would be:
+        {
+            "method":     "cluster.resource.pool.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyCluster",
+        }
+    """
+    logger.info(
+        '[%s] Getting ResourcePool using Cluster %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the Cluster by it's 'name' property
+    # and get the ResourcePool object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'resourcePool'],
+        obj_type=pyVmomi.vim.ClusterComputeResource,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_host = [props['resourcePool']]
+
+    # Get a list view of the ResourcePool from this VirtualMachine object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_host)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.ResourcePool,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='cluster.datacenter.get', required=['name'])
+def cluster_datacenter_get(agent, msg):
+    """
+    Get the Datacenter object attached to a specific Cluster
+    Example client message would be:
+        {
+            "method":     "host.datacenter.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyCluster",
+        }
+    """
+    logger.info(
+        '[%s] Getting Datacenter using Cluster %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the HostSystem by it's 'name' property
+    # and get the Datacenter object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'parent'],
+        obj_type=pyVmomi.vim.ClusterComputeResource,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_datacenter = props['parent']
+
+    # walk the parent heirarchy until the datacenter parent is found
+    obj_datacenter = [_parent_recurse(obj_datacenter, 'pyVmomi.VmomiSupport.vim.Datacenter')]
+
+    # Get a list view of the Datacenter from this VirtualMachine object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_datacenter)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.Datacenter,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='cluster.perf.metrics.get', required=['name', 'counter-name', 'perf-interval'])
+def cluster_perf_metrics_get(agent, msg):
+    """
+    Get performance metrics for a vim.ClusterComputeResource managed object
+
+    A vim.ClusterComputeResource managed entity supports historical
+    statistics only, so make sure to provide a valid historical
+    performance interval as part of the client message.
+
+    Example client message would be:
+
+    {
+        "method":   "cluster.perf.metrics.get",
+        "hostname": "vc01.example.org",
+        "name":     "MyCluster",
+        "counter-name": clusterServices.effectivemem.megaBytes  # Effective memory resources
+        "perf-interval": "Past day"  # Historical performance interval
+    }
+
+    Returns:
+        The retrieved performance metrics
+
+    """
+    obj = agent.get_object_by_property(
+        property_name='name',
+        property_value=msg['name'],
+        obj_type=pyVmomi.vim.ClusterComputeResource
+    )
+
+    if not obj:
+        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
+
+    counter_name = msg.get('counter-name')
+    interval_name = msg.get('perf-interval')
+
+    return _entity_perf_metrics_get(
+        agent=agent,
+        entity=obj,
+        counter_name=counter_name,
+        interval_name=interval_name
+    )
+
+
+def _folder_recurse(obj, filter_for_type):
+    ret = []
+    for child_entity in obj.childEntity:
+        child_entity_type = str(type(child_entity))
+        if filter_for_type in child_entity_type:
+            ret.append(child_entity)
+        elif 'pyVmomi.VmomiSupport.vim.Folder' in child_entity_type:
+            ret.extend(_folder_recurse(child_entity, filter_for_type))
+
+    return ret
+
+
+def _parent_recurse(obj, filter_for_type):
+    if obj is None or filter_for_type in str(type(obj)):
+        return obj
+    else:
+        return _parent_recurse(obj.parent, filter_for_type)
+
+
+@task(name='datacenter.get', required=['name', 'properties'])
+def datacenter_get(agent, msg):
+    """
+    Get properties of a single vim.Datacenter managed object
+
+    Example client message would be:
+
+    {
+        "method":     "datacenter.get",
+        "hostname":   "vc01.example.org",
+        "name":       "MyDatacenter",
+        "properties": [
+            "name",
+            "overallStatus"
+        ]
+    }
+
+    Returns:
+        The managed object properties in JSON format
 
     """
     # Property names to be collected
@@ -2596,13 +2289,335 @@ def datastore_discover(agent, msg):
     if 'properties' in msg and msg['properties']:
         properties.extend(msg['properties'])
 
-    r = _discover_objects(
+    data = vpoller.vsphere.tasks._get_object_properties(
         agent=agent,
         properties=properties,
-        obj_type=pyVmomi.vim.Datastore
+        obj_type=pyVmomi.vim.Datacenter,
+        obj_property_name='name',
+        obj_property_value=msg['name']
     )
 
+    if data.get('result') is not None:
+        if 'triggeredAlarmState' in properties:
+            triggeredAlarmState = data['result'][0].get('triggeredAlarmState')
+
+            alarms = []
+            alarm_count = 0
+            alarms_filtered = []
+            alarm_filtered_count = 0
+            if triggeredAlarmState is not None:
+
+                filteredAlarms = [
+                    re.compile('^Host CPU usage$', re.IGNORECASE),
+                    re.compile('^Host memory usage$', re.IGNORECASE),
+                    re.compile('^Virtual machine CPU usage$', re.IGNORECASE),
+                    re.compile('^Virtual machine memory usage$', re.IGNORECASE),
+                ]
+
+                for triggeredAlarm in triggeredAlarmState:
+                    alarm_name = triggeredAlarm.alarm.info.name
+                    alarm_desc = triggeredAlarm.alarm.info.description
+                    entity = triggeredAlarm.entity.name
+                    key = triggeredAlarm.key
+                    filtered = False
+                    for filteredAlarm in filteredAlarms:
+                        if filteredAlarm.match(alarm_name):
+                            filtered = True
+                            alarm_filtered_count += 1
+                            alarms_filtered.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+                            break
+                    if filtered:
+                        continue
+                    else:
+                        alarm_count += 1
+                        alarms.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+
+                data['result'][0]['triggeredAlarmState'] = '\n'.join(alarms)
+                data['result'][0]['triggeredAlarmFilteredState'] = '\n'.join(alarms_filtered)
+            else:
+                data['result'][0]['triggeredAlarmState'] = ''
+                data['result'][0]['triggeredAlarmFilteredState'] = ''
+
+            data['result'][0]['triggeredAlarmCount'] = alarm_count
+            data['result'][0]['triggeredAlarmFilteredCount'] = alarm_filtered_count
+
+    return data
+
+
+@task(name='datacenter.vm.get', required=['name'])
+def datacenter_vm_get(agent, msg):
+    """
+    Get all VirtualMachine objects attached to a specific Datacenter
+    Example client message would be:
+        {
+            "method":     "datacenter.host.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyDatacenter",
+        }
+    """
+    logger.info(
+        '[%s] Getting VirtualMachine list using Datacenter %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the Datacenter by it's 'name' property
+    # and get the HostSystem objects using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'vmFolder'],
+        obj_type=pyVmomi.vim.Datacenter,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_vm = props['vmFolder']
+
+    # obj_host is a Folder object of VirtualMachine and other Folders,
+    # but we need a list of VirtualMachine ones instead
+    obj_vm = _folder_recurse(obj_vm, 'pyVmomi.VmomiSupport.vim.VirtualMachine')
+
+    # Get a list view of the hosts from this datacenter object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_vm)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.VirtualMachine,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
     return r
+
+
+@task(name='datacenter.datastore.get', required=['name'])
+def datacenter_datastore_get(agent, msg):
+    """
+    Get all Datastore objects attached to a specific Datacenter
+    Example client message would be:
+        {
+            "method":     "datacenter.host.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyDatacenter",
+        }
+    """
+    logger.info(
+        '[%s] Getting Datastore list using Datacenter %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the Datacenter by it's 'name' property
+    # and get the HostSystem objects using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'datastore'],
+        obj_type=pyVmomi.vim.Datacenter,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_datastore = props['datastore']
+
+    # Get a list view of the hosts from this datacenter object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_datastore)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.Datastore,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='datacenter.cluster.get', required=['name'])
+def datacenter_cluster_get(agent, msg):
+    """
+    Get all ClusterComputeResource objects attached to a specific Datacenter
+    Example client message would be:
+        {
+            "method":     "datacenter.host.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyDatacenter",
+        }
+    """
+    logger.info(
+        '[%s] Getting ClusterComputeResource list using Datacenter %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the Datacenter by it's 'name' property
+    # and get the HostSystem objects using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'hostFolder'],
+        obj_type=pyVmomi.vim.Datacenter,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_host = props['hostFolder']
+
+    # obj_host is a Folder object,
+    # but we need a list of HostSystem ones instead
+    obj_host = obj_host.childEntity
+
+    # Get a list view of the hosts from this datacenter object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_host)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.ClusterComputeResource,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='datacenter.host.get', required=['name'])
+def datacenter_host_get(agent, msg):
+    """
+    Get all HostSystem objects attached to a specific Datacenter
+    Example client message would be:
+        {
+            "method":     "datacenter.host.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyDatacenter",
+        }
+    """
+    logger.info(
+        '[%s] Getting HostSystem list using Datacenter %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the Datacenter by it's 'name' property
+    # and get the HostSystem objects using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'hostFolder'],
+        obj_type=pyVmomi.vim.Datacenter,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_host = props['hostFolder']
+
+    # obj_host is a Folder object,
+    # but we need a list of HostSystem ones instead
+    obj_host = obj_host.childEntity
+
+    # obj_host is a list of ClusterComputeResource[] objects,
+    # but we need a list of HostSystem ones instead
+    obj_host = [item for sublist in [h.host for h in obj_host] for item in sublist]
+
+    # Get a list view of the hosts from this datacenter object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_host)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.HostSystem,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
+
+@task(name='datacenter.perf.metrics.get', required=['name', 'counter-name', 'perf-interval'])
+def datacenter_perf_metrics_get(agent, msg):
+    """
+    Get performance metrics for a vim.Datacenter managed object
+
+    A vim.Datacenter managed entity supports historical performance
+    metrics only, so a valid historical performance interval
+    should be provided as part of the client message.
+
+    Example client message would be:
+
+    {
+        "method":   "datacenter.perf.metrics.get",
+        "hostname": "vc01.example.org",
+        "name":     "MyDatacenter",
+        "counter-name": vmop.numPoweron.number  # VM power on count
+        "perf-interval": "Past day"  # Historical performance interval
+    }
+
+    Returns:
+        The retrieved performance metrics
+
+    """
+    obj = agent.get_object_by_property(
+        property_name='name',
+        property_value=msg['name'],
+        obj_type=pyVmomi.vim.Datacenter
+    )
+
+    if not obj:
+        return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
+
+    counter_name = msg.get('counter-name')
+    interval_name = msg.get('perf-interval')
+
+    return _entity_perf_metrics_get(
+        agent=agent,
+        entity=obj,
+        counter_name=counter_name,
+        interval_name=interval_name
+    )
+
 
 @task(name='datastore.get', required=['name', 'properties'])
 def datastore_get(agent, msg):
@@ -2631,7 +2646,17 @@ def datastore_get(agent, msg):
     if 'properties' in msg and msg['properties']:
         properties.extend(msg['properties'])
 
-    return _get_object_properties(
+    properties_readd = []
+    properties_remove = []
+    if 'host.key.config.fileSystemVolume.mountInfo.volume.extent' in properties:
+        properties_readd.append('host.key.config.fileSystemVolume.mountInfo.volume.extent')
+        properties.remove('host.key.config.fileSystemVolume.mountInfo.volume.extent')
+
+        if 'host' not in properties:
+            properties.extend(['host'])
+            properties_remove.append('host')
+
+    data = vpoller.vsphere.tasks._get_object_properties(
         agent=agent,
         properties=properties,
         obj_type=pyVmomi.vim.Datastore,
@@ -2639,185 +2664,119 @@ def datastore_get(agent, msg):
         obj_property_value=msg['name']
     )
 
-@task(name='datastore.alarm.get', required=['name'])
-def datastore_alarm_get(agent, msg):
-    """
-    Get all alarms for a vim.Datastore managed object
+    for property_remove in properties_remove:
+        properties.remove(property_remove)
+    properties.extend(properties_readd)
 
-    Example client message would be:
+    if data.get('result') is not None:
+        dspath = data['result'][0]['info.url'][5:][:-1]
+        if 'host.key.config.fileSystemVolume.mountInfo.volume.extent' in properties:
+            extents = []
+            hosts_data = data['result'][0].get('host')
+            if hosts_data is None:
+                hosts_data = []
+            for host in hosts_data:
+                # this is faster by far than just walking the path....
+                data_host = vpoller.vsphere.tasks._get_object_properties(
+                    agent=agent,
+                    properties=['name', 'config.fileSystemVolume.mountInfo', 'config.storageDevice.scsiLun'],
+                    obj_type=pyVmomi.vim.HostSystem,
+                    obj_property_name='name',
+                    obj_property_value=host.key.name
+                )
+                if data_host.get('result') is not None:
+                    for mountInfo in data_host['result'][0]['config.fileSystemVolume.mountInfo']:
+                        if mountInfo.mountInfo.path == dspath:
+                            if mountInfo.volume.type == 'NFS':
+                                extents.append({
+                                                   'diskName': 'NFS_' + mountInfo.volume.remoteHost + '_' + mountInfo.volume.remotePath.replace(
+                                                       '/', '_'), 'storageHost': mountInfo.volume.remoteHost,
+                                                   'lun': mountInfo.volume.remotePath, 'partition': '',
+                                                   'type': mountInfo.volume.type})
+                            else:
+                                for extent in mountInfo.volume.extent:
+                                    extents.append({'diskName': extent.diskName, 'partition': extent.partition,
+                                                    'type': mountInfo.volume.type})
+                                break
+                break
+            data['result'][0]['host.key.config.fileSystemVolume.mountInfo.volume.extent'] = extents
 
-        {
-            "method":   "datastore.alarm.get",
-            "hostname": "vc01.example.org",
-            "name":     "ds:///vmfs/volumes/643f118a-a970df28/"
-        }
+        if 'host' in properties:
+            hosts = []
+            hosts_data = data['result'][0].get('host')
+            if hosts_data is None:
+                hosts_data = []
+            for host in hosts_data:
+                hosts.append(host.key.name)
+            data['result'][0]['host'] = hosts
+        else:
+            del data['result'][0]['host']
 
-    Returns:
-        The discovered alarms in JSON format
+        if 'vm' in properties:
+            vms = []
+            vms_data = data['result'][0].get('vm')
+            if vms_data is None:
+                vms_data = []
+            for vm in vms_data:
+                vms.append(vm.name)
 
-    """
-    result = _object_alarm_get(
-        agent=agent,
-        obj_type=pyVmomi.vim.Datastore,
-        obj_property_name='info.url',
-        obj_property_value=msg['name']
-    )
+            data['result'][0]['vm'] = vms
 
-    return result
+        if 'triggeredAlarmState' in properties:
+            triggeredAlarmState = data['result'][0].get('triggeredAlarmState')
+
+            alarms = []
+            alarm_count = 0
+            alarms_filtered = []
+            alarm_filtered_count = 0
+            if triggeredAlarmState is not None:
+
+                filteredAlarms = [
+                    re.compile('^Datastore usage on disk$', re.IGNORECASE),
+                ]
+
+                for triggeredAlarm in triggeredAlarmState:
+                    alarm_name = triggeredAlarm.alarm.info.name
+                    alarm_desc = triggeredAlarm.alarm.info.description
+                    entity = triggeredAlarm.entity.name
+                    key = triggeredAlarm.key
+                    filtered = False
+                    for filteredAlarm in filteredAlarms:
+                        if filteredAlarm.match(alarm_name):
+                            filtered = True
+                            alarm_filtered_count += 1
+                            alarms_filtered.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+                            break
+                    if filtered:
+                        continue
+                    else:
+                        alarm_count += 1
+                        alarms.append(entity + ' - ' + key + ' - ' + alarm_name + ' - ' + alarm_desc)
+
+                data['result'][0]['triggeredAlarmState'] = '\n'.join(alarms)
+                data['result'][0]['triggeredAlarmFilteredState'] = '\n'.join(alarms_filtered)
+            else:
+                data['result'][0]['triggeredAlarmState'] = ''
+                data['result'][0]['triggeredAlarmFilteredState'] = ''
+
+            data['result'][0]['triggeredAlarmCount'] = alarm_count
+            data['result'][0]['triggeredAlarmFilteredCount'] = alarm_filtered_count
+
+    return data
+
 
 @task(name='datastore.host.get', required=['name'])
 def datastore_host_get(agent, msg):
-    """
-    Get all HostSystem objects attached to a specific Datastore
+    raise ValueError('Use datastore.get with -p host instead...')
 
-    Example client message would be:
-
-        {
-            "method":     "datastore.host.get",
-            "hostname":   "vc01.example.org",
-            "name":       "ds:///vmfs/volumes/643f118a-a970df28/",
-        }
-
-    """
-    logger.info(
-        '[%s] Getting HostSystem list using Datastore %s',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the Datastore by it's 'info.url' property
-    # and get the HostSystem objects using it
-    data = _get_object_properties(
-        agent=agent,
-        properties=['host'],
-        obj_type=pyVmomi.vim.Datastore,
-        obj_property_name='info.url',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    # Get properties from the result
-    props = data['result'][0]
-    obj_host = props['host']
-
-    # obj_host is a list of DatastoreHostMount[] objects,
-    # but we need a list of HostSystem ones instead
-    obj_host = [h.key for h in obj_host]
-
-    # Get a list view of the hosts from this datastore object
-    # and collect their properties
-    view_ref = agent.get_list_view(obj=obj_host)
-    result = agent.collect_properties(
-        view_ref=view_ref,
-        obj_type=pyVmomi.vim.HostSystem,
-        path_set=['name']
-    )
-
-    view_ref.DestroyView()
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': result,
-    }
-
-    return r
 
 @task(name='datastore.vm.get', required=['name'])
 def datastore_vm_get(agent, msg):
-    """
-    Get all VirtualMachine objects using a specific Datastore
+    raise ValueError('Use datastore.get with -p vm instead...')
 
-    Example client message would be:
 
-        {
-            "method":     "datastore.vm.get",
-            "hostname":   "vc01.example.org",
-            "name":       "ds:///vmfs/volumes/643f118a-a970df28/",
-        }
-
-    """
-    logger.info(
-        '[%s] Getting VirtualMachine list using Datastore %s',
-        agent.host,
-        msg['name']
-    )
-
-    # Find the Datastore by it's 'info.url' property and get the
-    # VirtualMachine objects using it
-    data = _get_object_properties(
-        agent=agent,
-        properties=['vm'],
-        obj_type=pyVmomi.vim.Datastore,
-        obj_property_name='info.url',
-        obj_property_value=msg['name']
-    )
-
-    if data['success'] != 0:
-        return data
-
-    # Get properties from the result
-    props = data['result'][0]
-    obj_vm = props['vm']
-
-    # Get a list view of the VMs from this datastore object
-    # and collect their properties
-    view_ref = agent.get_list_view(obj=obj_vm)
-    result = agent.collect_properties(
-        view_ref=view_ref,
-        obj_type=pyVmomi.vim.VirtualMachine,
-        path_set=['name']
-    )
-
-    view_ref.DestroyView()
-
-    r = {
-        'success': 0,
-        'msg': 'Successfully discovered objects',
-        'result': result,
-    }
-
-    return r
-
-@task(name='datastore.perf.metric.info', required=['name'])
-def datastore_perf_metric_info(agent, msg):
-    """
-    Get performance counters available for a vim.Datastore object
-
-    Example client message would be:
-
-        {
-            "method":       "datastore.perf.metric.info",
-            "hostname":     "vc01.example.org",
-            "name":         "ds:///vmfs/volumes/643f118a-a970df28/",
-            "counter-name": <counter-id>
-        }
-
-    Returns:
-        Information about the supported performance counters for the object
-
-    """
-    obj = agent.get_object_by_property(
-        property_name='info.url',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.Datastore
-    )
-
-    if not obj:
-        return {'success': 1, 'msg': 'Cannot find object {}'.format(msg['name'])}
-
-    counter_name = msg.get('counter-name')
-
-    return _entity_perf_metric_info(
-        agent=agent,
-        entity=obj,
-        counter_name=counter_name
-    )
-
-@task(name='datastore.perf.metric.get', required=['name', 'counter-name'])
-def datastore_perf_metric_get(agent, msg):
+@task(name='datastore.perf.metrics.get', required=['name', 'counter-name'])
+def datastore_perf_metrics_get(agent, msg):
     """
     Get performance metrics for a vim.Datastore managed object
 
@@ -2827,7 +2786,7 @@ def datastore_perf_metric_get(agent, msg):
     Example client message would be:
 
         {
-            "method":     "datastore.perf.metric.get",
+            "method":     "datastore.perf.metrics.get",
             "hostname":   "vc01.example.org",
             "name":       "ds:///vmfs/volumes/643f118a-a970df28/",
             "counter-id": "datastore.numberReadAveraged.number"
@@ -2837,7 +2796,7 @@ def datastore_perf_metric_get(agent, msg):
     performance interval as part of the message, e.g.:
 
         {
-            "method":   "datastore.perf.metric.get",
+            "method":   "datastore.perf.metrics.get",
             "hostname": "vc01.example.org",
             "name":     "ds:///vmfs/volumes/643f118a-a970df28/",
             "properties": "datastore.numberReadAveraged.number",
@@ -2848,17 +2807,23 @@ def datastore_perf_metric_get(agent, msg):
         The retrieved performance metrics
 
     """
-    obj = agent.get_object_by_property(
-        property_name='info.url',
-        property_value=msg['name'],
-        obj_type=pyVmomi.vim.Datastore
+    data_ds = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['summary.datastore', 'name', 'info.url', 'host'],
+        obj_type=pyVmomi.vim.Datastore,
+        obj_property_name='info.url',
+        obj_property_value=msg['name']
     )
 
-    if not obj:
+    if data_ds.get('result') is not None and len(data_ds.get('result')) < 1:
         return {'success': 1, 'msg': 'Cannot find object: {}'.format(msg['name'])}
 
     try:
-        counter_name = msg.get('counter-name')
+        counter_name = msg.get('counter-name').split(',')
+        if 'disk.capacity.bytes.latest' in counter_name:
+            counter_name.remove('disk.capacity.bytes.latest')
+        counter_name = ','.join(counter_name)
+
         max_sample = int(msg.get('max-sample')) if msg.get('max-sample') else 1
         interval_name = msg.get('perf-interval')
         instance = msg.get('instance') if msg.get('instance') else ''
@@ -2869,76 +2834,159 @@ def datastore_perf_metric_get(agent, msg):
             'msg': 'Invalid message, cannot retrieve performance metrics'
         }
 
-    return _entity_perf_metric_get(
+    data = _entity_perf_metrics_get(
         agent=agent,
-        entity=obj,
+        entity=data_ds['result'][0]['summary.datastore'],
         counter_name=counter_name,
         max_sample=max_sample,
         instance=instance,
         interval_name=interval_name
     )
 
-@task(name='vsan.health.get', required=['name'])
-def vsan_health_get(agent, msg):
+    if data.get('result') is not None:
+        if 'disk.capacity.bytes.latest' in msg['counter-name'].split(','):
+            # get instance name:
+            disk_name = ''
+            for metric in data['result']:
+                disk_name = metric['instance']
+                if disk_name != '':
+                    break
+
+            if disk_name != '':
+                hosts_data = data_ds['result'][0]['host']
+                if hosts_data is None:
+                    hosts_data = []
+                for host in hosts_data:
+                    # this is faster by far than just walking the path....
+                    data_host = vpoller.vsphere.tasks._get_object_properties(
+                        agent=agent,
+                        properties=['name', 'config.storageDevice.scsiLun'],
+                        obj_type=pyVmomi.vim.HostSystem,
+                        obj_property_name='name',
+                        obj_property_value=host.key.name
+                    )
+                    if data_host.get('result') is not None:
+                        for scsiLun in data_host['result'][0]['config.storageDevice.scsiLun']:
+                            if scsiLun.canonicalName == disk_name:
+                                capacity = getattr(scsiLun, 'capacity')
+                                capacity_bytes = getattr(capacity, 'block') * getattr(capacity, 'blockSize')
+                                data['result'].append({'instance': disk_name, 'counterId': 'disk.capacity.bytes.latest',
+                                                       'value': capacity_bytes,
+                                                       'timestamp': '%Y-%m-%d %H:%M:%S+00:00'.format(
+                                                           datetime.datetime.now())})
+                    break
+
+    return data
+
+
+@task(name='resource.pool.cluster.get', required=['name'])
+def resource_pool_cluster_get(agent, msg):
     """
-    Get VSAN health state for a host
-
+    Get the Cluster objects attached to a specific ResourcePool
     Example client message would be:
-
         {
-            "method":       "vsan.health.get",
-            "hostname":     "vc01.example.org",
-            "name":         "esxi01.example.org"
+            "method":     "resource.pool.cluster.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyResourcePool",
         }
-
-    Returns:
-        VSAN health state for the host
-
     """
     logger.info(
-        '[%s] Retrieving VSAN health state for %s',
+        '[%s] Getting Cluster using ResourcePool %s',
         agent.host,
-        msg['name'],
+        msg['name']
     )
 
-    properties = [
-        'name',
-        'runtime.powerState',
-        'runtime.connectionState'
-    ]
-
-    data = _get_object_properties(
+    # Find the ResourcePool by it's 'name' property
+    # and get the Cluster object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
         agent=agent,
-        properties=properties,
-        obj_type=pyVmomi.vim.HostSystem,
+        properties=['name', 'owner'],
+        obj_type=pyVmomi.vim.ResourcePool,
         obj_property_name='name',
-        obj_property_value=msg['name'],
-        include_mors=True
+        obj_property_value=msg['name']
     )
 
     if data['success'] != 0:
         return data
 
-    result = data['result'][0]
-    if result['runtime.powerState'] != pyVmomi.vim.HostSystemPowerState.poweredOn:
-        return {'success': 1, 'msg': 'Host is not powered on, cannot get VSAN health state'}
+    # Get properties from the result
+    props = data['result'][0]
+    obj_cluster = [props['owner']]
 
-    if result['runtime.connectionState'] != pyVmomi.vim.HostSystemConnectionState.connected:
-        return {'success': 1, 'msg': 'Host is not connected, cannot get VSAN health state'}
+    # Get a list view of the Cluster from this ResourcePool object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_cluster)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.ClusterComputeResource,
+        path_set=['name']
+    )
 
-    obj = result['obj']
-    status = obj.configManager.vsanSystem.QueryHostStatus()
-    health = {
-        'name': obj.name,
-        'uuid': status.uuid,
-        'nodeUuid': status.nodeUuid,
-        'health': status.health,
-    }
+    view_ref.DestroyView()
 
-    result = {
+    r = {
         'success': 0,
-        'msg': 'Successfully retrieved object properties',
-        'result': [health],
+        'msg': 'Successfully discovered objects',
+        'result': result,
     }
 
-    return result
+    return r
+
+
+@task(name='datastore.datacenter.get', required=['name'])
+def datastore_datacenter_get(agent, msg):
+    raise ValueError('Use datastore.get with -p datacenter (needs implemented) instead...')
+    """
+    Get the Datacenter object attached to a specific Datastore
+    Example client message would be:
+        {
+            "method":     "host.datacenter.get",
+            "hostname":   "vc01.example.org",
+            "name":       "MyDatastore",
+        }
+    """
+    logger.info(
+        '[%s] Getting Datacenter using Datastore %s',
+        agent.host,
+        msg['name']
+    )
+
+    # Find the Datastore by it's 'name' property
+    # and get the Datacenter object using it
+    data = vpoller.vsphere.tasks._get_object_properties(
+        agent=agent,
+        properties=['name', 'parent'],
+        obj_type=pyVmomi.vim.Datastore,
+        obj_property_name='name',
+        obj_property_value=msg['name']
+    )
+
+    if data['success'] != 0:
+        return data
+
+    # Get properties from the result
+    props = data['result'][0]
+    obj_datacenter = props['parent']
+
+    # walk the parent heirarchy until the datacenter parent is found
+    obj_datacenter = [_parent_recurse(obj_datacenter, 'pyVmomi.VmomiSupport.vim.Datacenter')]
+
+    # Get a list view of the Datacenter from this VirtualMachine object
+    # and collect their properties
+    view_ref = agent.get_list_view(obj=obj_datacenter)
+    result = agent.collect_properties(
+        view_ref=view_ref,
+        obj_type=pyVmomi.vim.Datacenter,
+        path_set=['name']
+    )
+
+    view_ref.DestroyView()
+
+    r = {
+        'success': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+
+    return r
+
