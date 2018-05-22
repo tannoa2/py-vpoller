@@ -20,6 +20,9 @@ import vpoller.vsphere.tasks
 from vconnector.core import VConnector
 from vconnector.cache import CachedObject
 
+import vsan
+import vsanmgmtObjects
+
 
 def get_object_by_property_cache_all(self, property_name, property_value, obj_type):
     """
@@ -2983,10 +2986,73 @@ def datastore_datacenter_get(agent, msg):
     view_ref.DestroyView()
 
     r = {
-        'success': 0,
+        'successs': 0,
         'msg': 'Successfully discovered objects',
         'result': result,
     }
 
     return r
+
+
+@task(name='vsan.usage.get')
+def vsan_usage_get(agent, msg):
+    """
+    Args:
+        agent:
+        msg:
+
+    Returns:
+
+    """
+    client = vsan.client(msg['hostname'], msg['username'], msg['password'], msg['name'])
+    result = client.usage()
+    r = {
+        'successs': 0,
+        'msg': 'Successfully discovered objects',
+        'result': result,
+    }
+    return r
+
+
+@task(name='vsan.health.get')
+def vsan_health_get(agent, msg):
+    """
+    Args:
+        agent:
+        msg:
+
+    Returns:
+
+    """
+    client = vsan.client(msg['hostname'], msg['username'], msg['password'], msg['name'])
+    result = client.health()
+    r = {
+        'successs': 0,
+        'msg': 'Returning the vSan health',
+        'result': result,
+    }
+    print result
+    return r
+
+@task(name='vsan.config.get')
+def vsan_config_get(agent, msg):
+    """
+    Args:
+        agent:
+        msg:
+
+    Returns:
+
+    """
+    client = vsan.client(msg['hostname'], msg['username'], msg['password'], msg['name'])
+    result = client.config()
+    r = {
+        'successs': 0,
+        'msg': 'Returning the vSan config',
+        'result': result,
+    }
+    return r
+
+
+
 
